@@ -1,0 +1,172 @@
+# =============================================================================
+# causal-stock-predictor — .gitignore
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Environment & secrets — NEVER commit these
+# -----------------------------------------------------------------------------
+.env
+.env.local
+.env.production
+*.env
+!.env.example                          # keep the example template
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+sdist/
+
+# Type checking + linting
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+nosetests.xml
+*.xml
+
+# -----------------------------------------------------------------------------
+# ML — data + model artefacts
+# -----------------------------------------------------------------------------
+
+# Raw data — too large for git, pulled via loader.py
+ml/data/raw/
+ml/data/live/
+ml/data/processed/
+
+# Trained model weights — too large, regenerated via training
+ml/saved_models/*.pkl
+ml/saved_models/*.pt
+ml/saved_models/*.h5
+ml/saved_models/*.joblib
+
+# Keep causal features JSON — small + important for reproducibility
+!ml/saved_models/causal_features_*.json
+
+# Logs
+ml/logs/
+
+# Jupyter notebooks — strip outputs before committing
+# (outputs contain data that shouldn't be in git)
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# -----------------------------------------------------------------------------
+# Node / Frontend
+# -----------------------------------------------------------------------------
+node_modules/
+frontend/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# Build output
+frontend/dist/
+frontend/build/
+frontend/.vite/
+
+# Cache
+frontend/.cache/
+.eslintcache
+
+# -----------------------------------------------------------------------------
+# Docker
+# -----------------------------------------------------------------------------
+*.log
+docker-compose.override.yml
+
+# -----------------------------------------------------------------------------
+# OS
+# -----------------------------------------------------------------------------
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# -----------------------------------------------------------------------------
+# IDEs
+# -----------------------------------------------------------------------------
+
+# VSCode
+.vscode/
+!.vscode/extensions.json              # keep recommended extensions
+!.vscode/settings.json                # keep shared settings if you want
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Vim / Emacs
+*.swp
+*.swo
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+
+# -----------------------------------------------------------------------------
+# Misc
+# -----------------------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+.hypothesis/

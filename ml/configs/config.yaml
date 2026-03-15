@@ -1,0 +1,246 @@
+# =============================================================================
+# causal-stock-predictor — master config
+# All hardcoded values across the entire project live here.
+# Every module reads from this file. Nothing is hardcoded elsewhere.
+# =============================================================================
+
+project:
+  name: causal-stock-predictor
+  version: 0.1.0
+  random_seed: 42                         # used in train/test splits + model init
+
+# -----------------------------------------------------------------------------
+# Data — directories + tickers + date ranges
+# -----------------------------------------------------------------------------
+data:
+  start_date: "2010-01-01"               # historical pull start
+  end_date:   "2025-12-31"               # historical pull end
+
+  # Relative to project root
+  raw_dir:       "ml/data/raw"           # written once during training
+  live_dir:      "ml/data/live"          # overwritten at every inference call
+  processed_dir: "ml/data/processed"     # feature matrices + regime labels
+
+  tickers:
+    target:                              # stocks we predict
+      - AAPL
+      - MSFT
+      - GOOGL
+
+    macro:                               # causal candidate — macro signals
+      - "^VIX"                           # CBOE Volatility Index
+      - "^TNX"                           # 10Y US Treasury Yield
+      - "^IRX"                           # 3M US Treasury Yield (for spread)
+      - "DX-Y.NYB"                       # US Dollar Index
+      - "GC=F"                           # Gold Futures
+      - "CL=F"                           # Crude Oil Futures
+      - "^GSPC"                          # S&P 500
+
+    sector_etfs:                         # causal candidate — sector momentum
+      - XLK                              # Technology
+      - XLF                              # Financials
+      - XLE                              # Energy
+      - XLV                              # Healthcare
+      - XLI                              # Industrials
+
+  # Columns to keep from yFinance OHLCV download
+  price_columns: ["open", "high", "low", "close", "volume"]
+
+  # How many calendar days of history needed to build one live feature vector
+  # Must be > max rolling window used in features (30d vol + 10d sentiment etc.)
+  live_lookback_days: 90
+
+# -----------------------------------------------------------------------------
+# Finnhub API
+# -----------------------------------------------------------------------------
+finnhub:
+  api_key:  ${FINNHUB_API_KEY}           # injected from .env — never hardcode
+  base_url: "https://finnhub.io/api/v1"
+
+  # Historical sentiment: chunk size when iterating date range
+  sentiment_window_days: 30             # Finnhub free tier max window per call
+
+  # Rate limiting — free tier is 60 calls/min
+  request_delay_seconds: 0.5            # sleep between Finnhub calls
+  max_retries: 3                        # retry on 429 / timeout
+  timeout_seconds: 10
+
+# -----------------------------------------------------------------------------
+# Feature engineering
+# Used by: technical.py, macro.py, sentiment.py, pipeline.py
+# -----------------------------------------------------------------------------
+features:
+
+  technical:
+    rsi_period: 14
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    bollinger_window: 20
+    bollinger_std: 2
+    momentum_windows: [5, 10, 20]       # lookback days for momentum features
+    volatility_windows: [10, 20, 30]    # lookback days for rolling std dev
+    atr_period: 14                      # Average True Range
+
+  macro:
+    vix_change_windows: [1, 5]          # 1d and 5d VIX change
+    yield_spread: true                  # compute 10Y - 3M spread
+    cross_asset_returns: true           # daily log returns for all macro tickers
+    macro_rolling_windows: [5, 10]      # rolling mean for macro features
+
+  sentiment:
+    rolling_windows: [3, 5, 10]        # rolling avg windows for sentiment score
+    buzz_windows: [3, 5]               # rolling avg windows for article count
+
+  # Minimum non-NaN rows required after feature engineering
+  min_rows_after_engineering: 200
+
+# -----------------------------------------------------------------------------
+# Causal discovery
+# Used by: granger.py, pcmci.py, selector.py
+# -----------------------------------------------------------------------------
+causal:
+
+  granger:
+    max_lag: 5                          # max lag (days) tested
+    significance: 0.05                  # p-value threshold
+    test: "ssr_chi2test"                # ssr_chi2test | ssr_ftest | lrtest | params_ftest
+
+  pcmci:
+    tau_min: 1                          # minimum lag (0 = contemporaneous, avoid)
+    tau_max: 5                          # maximum lag in days
+    pc_alpha: 0.05                      # significance for PC condition-selection step
+    cond_ind_test: "ParCorr"            # ParCorr | GPDC | CMIknn
+    alpha_level: 0.01                   # final MCI test significance threshold
+
+  selector:
+    # "intersection" = must appear in both PCMCI + Granger (stricter, better for paper)
+    # "union"        = appears in either (more permissive)
+    strategy: "intersection"
+    min_causal_features: 3             # abort if fewer than this survive selection
+    max_causal_features: 15            # cap to avoid overfitting
+
+# -----------------------------------------------------------------------------
+# Model training
+# Used by: lgbm_model.py, xgb_model.py, arima_model.py, ensemble.py
+# -----------------------------------------------------------------------------
+model:
+
+  # What we are predicting
+  target: "excess_return_5d"           # 5-day forward excess return (vs SPY)
+  horizon_days: 5                      # must match target definition
+
+  # Train / val / test split (chronological — no shuffling)
+  train_ratio: 0.70
+  val_ratio:   0.15
+  test_ratio:  0.15
+
+  # Scaler applied to features before training
+  # saved as scaler_{ticker}.pkl — must be reused at inference
+  scaler: "StandardScaler"             # StandardScaler | RobustScaler | None
+
+  lgbm:
+    n_estimators: 500
+    learning_rate: 0.05
+    max_depth: 6
+    num_leaves: 31
+    min_child_samples: 20
+    subsample: 0.8
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    reg_alpha: 0.1                     # L1 regularisation
+    reg_lambda: 1.0                    # L2 regularisation
+    early_stopping_rounds: 50          # stop if val loss does not improve
+    verbose: -1                        # suppress LightGBM output
+
+  xgb:
+    n_estimators: 500
+    learning_rate: 0.05
+    max_depth: 6
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    early_stopping_rounds: 50
+    verbosity: 0
+
+  arima:
+    max_p: 5                           # autoarima search range
+    max_q: 5
+    max_d: 2
+    seasonal: false                    # no seasonality for daily returns
+    information_criterion: "aic"       # aic | bic
+
+  ensemble:
+    # Weights when TFT is NOT available (default)
+    weights:
+      lgbm:  0.50
+      xgb:   0.35
+      arima: 0.15
+
+    # Weights when TFT IS available (pytorch-forecasting installed)
+    weights_with_tft:
+      lgbm:  0.35
+      xgb:   0.25
+      arima: 0.10
+      tft:   0.30
+
+    # Confidence band z-score multiplier
+    # 1.645 = 90% CI | 1.960 = 95% CI | 2.576 = 99% CI
+    confidence_z: 1.645
+
+# -----------------------------------------------------------------------------
+# Evaluation + backtesting
+# Used by: metrics.py, regime_splitter.py, backtester.py
+# -----------------------------------------------------------------------------
+evaluation:
+
+  # Market regime definitions
+  regimes:
+    bull:        ["2010-01-01", "2019-12-31"]   # pre-COVID bull run
+    covid_crash: ["2020-01-01", "2020-06-30"]   # crash + initial shock
+    recovery:    ["2020-07-01", "2021-12-31"]   # stimulus-driven recovery
+    rate_hike:   ["2022-01-01", "2022-12-31"]   # Fed tightening cycle
+    ai_bull:     ["2023-01-01", "2025-12-31"]   # AI-driven bull run
+
+  # Walk-forward backtest settings
+  backtest:
+    initial_train_years: 3             # minimum years before first test window
+    step_size_months: 3                # roll forward by this many months each step
+    min_test_samples: 60               # skip window if fewer test rows than this
+
+  # Trading simulation — for Sharpe + drawdown calculation
+  trading:
+    initial_capital: 100000            # USD
+    transaction_cost_bps: 10          # basis points per trade (0.10%)
+    risk_free_rate_annual: 0.04        # 4% annualised — Sharpe denominator
+    trading_days_per_year: 252
+
+  # Metrics to compute and report
+  metrics:
+    - directional_accuracy             # % of correct up/down calls
+    - sharpe_ratio                     # annualised
+    - rmse                             # on log returns
+    - mape                             # on log returns
+    - max_drawdown                     # worst peak-to-trough in test period
+    - calmar_ratio                     # annualised return / max drawdown
+
+# -----------------------------------------------------------------------------
+# Saved model artefacts
+# Used by: all model files + backend/prediction_service.py
+# -----------------------------------------------------------------------------
+saved_models:
+  dir: "ml/saved_models"
+  lgbm_filename:            "lgbm_{ticker}.pkl"
+  xgb_filename:             "xgb_{ticker}.pkl"
+  arima_filename:           "arima_{ticker}.pkl"
+  scaler_filename:          "scaler_{ticker}.pkl"
+  causal_features_filename: "causal_features_{ticker}.json"
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"                        # DEBUG | INFO | WARNING | ERROR
+  format: "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+  log_dir: "ml/logs"                   # set to null to disable file logging
