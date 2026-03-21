@@ -212,17 +212,15 @@ def step5_sample_prediction(
     from ml.src.evaluation.metrics import Metrics
     from ml.src.evaluation.regime_splitter import RegimeSplitter
 
+    # NIFTY — skip live prediction (no real-time P/E, P/B, headlines available)
+    # Live prediction quality would be misleading without the same data quality as training
     if is_nifty_ticker(ticker) or market == "india":
-        # For NIFTY — use last row of feature matrix as live features
-        logger.info("Indian market — using latest data from feature matrix...")
-        feat_path    = get_feat_path(ticker)
-        df_full      = pd.read_csv(feat_path, index_col=0, parse_dates=True)
-        from ml.src.data.loader import _load_config
-        cfg          = _load_config()
-        target       = cfg["model"]["target"]
-        feature_cols = [c for c in df_full.columns if c != target]
-        row          = df_full[feature_cols].iloc[-1]
-        current_price = float(df_full["close"].iloc[-1]) if "close" in df_full.columns else 0.0
+        logger.info(
+            "[nifty] Skipping live prediction — real-time P/E, P/B and headlines "
+            "not available. Showing model performance on historical data only."
+        )
+        result       = None
+        current_price = None
     else:
         logger.info("Fetching live data...")
         loader        = DataLoader()
@@ -231,16 +229,16 @@ def step5_sample_prediction(
         row           = pipeline.build_live(ticker, live)
         current_price = float(live["prices"]["close"].iloc[-1])
 
-    logger.info("Running prediction...")
-    ensemble = Ensemble()
-    ensemble.load(ticker)
+        logger.info("Running prediction...")
+        ensemble = Ensemble()
+        ensemble.load(ticker)
 
-    result = ensemble.predict_live(
-        live_features=row,
-        ticker=ticker,
-        current_price=current_price,
-        causal_features=causal_features,
-    )
+        result = ensemble.predict_live(
+            live_features=row,
+            ticker=ticker,
+            current_price=current_price,
+            causal_features=causal_features,
+        )
 
     # Option B regime metrics
     model_metrics = {}
@@ -287,38 +285,46 @@ def step5_sample_prediction(
 
     W = 60
     print(f"\n{'='*W}")
-    print(f"  LIVE PREDICTION — {ticker}   ({result.prediction_date})")
-    print(f"{'='*W}")
-    print(f"  Current price:    {current_price:.2f}")
-    print(f"  Predicted price:  {result.predicted_price:.2f}")
-    print(f"  Direction:        {result.direction}")
-    print(f"  Expected return:  {result.predicted_return:+.2%}")
-    print(f"  Confidence:       {result.confidence:.0%}")
-    print(f"  Range (90% CI):   {result.lower_band:.2f} — {result.upper_band:.2f}")
-    print(f"  Horizon:          {result.horizon_days} trading days")
-    print(f"  Model:            {result.model_name}")
-    print(f"\n  Causal Drivers:")
-    for d in result.causal_drivers:
-        shap  = d.get("shap", d["value"])
-        arrow = "▲" if d["impact"] == "positive" else "▼"
-        print(f"    {arrow} {d['feature']:30s} {d['impact']:8s}  ({shap:+.4f})")
+    if result is not None:
+        print(f"  LIVE PREDICTION — {ticker}   ({result.prediction_date})")
+        print(f"{'='*W}")
+        print(f"  Current price:    ${result.current_price:.2f}")
+        print(f"  Predicted price:  ${result.predicted_price:.2f}")
+        print(f"  Direction:        {result.direction}")
+        print(f"  Expected return:  {result.predicted_return:+.2%}")
+        print(f"  Confidence:       {result.confidence:.0%}")
+        print(f"  Range (90% CI):   ${result.lower_band:.2f} — ${result.upper_band:.2f}")
+        print(f"  Horizon:          {result.horizon_days} trading days")
+        print(f"  Model:            {result.model_name}")
+        print(f"\n  Causal Drivers:")
+        for d in result.causal_drivers:
+            shap  = d.get("shap", d["value"])
+            arrow = "▲" if d["impact"] == "positive" else "▼"
+            print(f"    {arrow} {d['feature']:30s} {d['impact']:8s}  ({shap:+.4f})")
+    else:
+        print(f"  MODEL REPORT — {ticker}")
+        print(f"{'='*W}")
+        print(f"  Live prediction not available for NIFTY index.")
+        print(f"  Real-time P/E, P/B and news headlines not available.")
     print(f"\n  Causal Features Used ({len(causal_features)}):")
     print(f"    {', '.join(causal_features)}")
-    if model_metrics and "overall" in model_metrics:
-        regimes_order = ["overall"] + [r for r in model_metrics if r != "overall"]
-        print(f"\n  Model Performance (Option B — pre-regime train, test on regime):")
-        header = f"    {'Metric':<25} " + "".join(f"  {r[:12]:>12}" for r in regimes_order)
-        print(header)
-        print("    " + "-"*25 + "".join("  " + "-"*12 for _ in regimes_order))
-        for metric in ["directional_accuracy","sharpe_ratio","max_drawdown","calmar_ratio","rmse"]:
-            row_str = f"    {metric:<25}"
-            for regime in regimes_order:
-                val = model_metrics.get(regime, {}).get(metric, float("nan"))
-                row_str += f"  {'N/A':>12}" if val != val else f"  {val:>12.4f}"
-            print(row_str)
-        print(f"\n    Option B: each regime tested on data the model never saw during training")
-        print(f"    Random baseline = 0.50  |  Target > 0.52")
+    if model_metrics:
+        regimes_order = (["overall"] if "overall" in model_metrics else []) +                         [r for r in model_metrics if r != "overall"]
+        if regimes_order:
+            print(f"\n  Model Performance (Option B — pre-regime train, test on regime):")
+            header = f"    {'Metric':<25} " + "".join(f"  {r[:12]:>12}" for r in regimes_order)
+            print(header)
+            print("    " + "-"*25 + "".join("  " + "-"*12 for _ in regimes_order))
+            for metric in ["directional_accuracy","sharpe_ratio","max_drawdown","calmar_ratio","rmse"]:
+                row_str = f"    {metric:<25}"
+                for regime in regimes_order:
+                    val = model_metrics.get(regime, {}).get(metric, float("nan"))
+                    row_str += f"  {'N/A':>12}" if val != val else f"  {val:>12.4f}"
+                print(row_str)
+            print(f"\n    Option B: each regime tested on data the model never saw during training")
+            print(f"    Random baseline = 0.50  |  Target > 0.52")
     print(f"{'='*W}")
+
 
 
 def step6_regime_backtest(
