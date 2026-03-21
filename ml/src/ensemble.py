@@ -58,6 +58,7 @@ try:
 except ImportError:
     TFT_AVAILABLE = False
 from ml.src.causal.selector import CausalSelector
+from ml.src.models.tuner import HyperparameterTuner
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,16 @@ class Ensemble:
         )
         # XGBoost uses same scaler
         _, _, _ = self.xgb.scale(X_train, X_val, X_test, ticker)
+
+        # Optuna tuning (if enabled in config)
+        tuner = HyperparameterTuner()
+        if tuner.enabled:
+            logger.info("[ensemble] Running Optuna hyperparameter tuning...")
+            best_lgbm = tuner.tune_lgbm(X_train_s, y_train, X_val_s, y_val, ticker)
+            best_xgb  = tuner.tune_xgb(X_train_s, y_train, X_val_s, y_val, ticker)
+            # Apply tuned params
+            self.lgbm._params.update(best_lgbm)
+            self.xgb._params.update(best_xgb)
 
         # Train LightGBM
         self.lgbm.fit(X_train_s, y_train, X_val_s, y_val)
@@ -385,6 +396,7 @@ if __name__ == "__main__":
     import argparse
     import pandas as pd
     from ml.src.causal.selector import CausalSelector
+    from ml.src.models.tuner import HyperparameterTuner
     from ml.src.evaluation.metrics import Metrics
     from ml.src.data.loader import _load_config
 

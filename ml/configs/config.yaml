@@ -27,7 +27,20 @@ data:
       - MSFT
       - GOOGL
 
-    macro:                               # causal candidate — macro signals
+    # ── Nifty 50 targets (use with market: india) ──
+    target_india:
+      - RELIANCE.NS                      # Reliance Industries
+      - TCS.NS                           # Tata Consultancy Services
+      - INFY.NS                          # Infosys
+      - HDFCBANK.NS                      # HDFC Bank
+      - ICICIBANK.NS                     # ICICI Bank
+      - HINDUNILVR.NS                    # Hindustan Unilever
+      - ITC.NS                           # ITC
+      - SBIN.NS                          # State Bank of India
+      - BAJFINANCE.NS                    # Bajaj Finance
+      - WIPRO.NS                         # Wipro
+
+    macro:                               # US macro signals (default)
       - "^VIX"                           # CBOE Volatility Index
       - "^TNX"                           # 10Y US Treasury Yield
       - "^IRX"                           # 3M US Treasury Yield (for spread)
@@ -36,12 +49,27 @@ data:
       - "CL=F"                           # Crude Oil Futures
       - "^GSPC"                          # S&P 500
 
-    sector_etfs:                         # causal candidate — sector momentum
+    macro_india:                         # India macro signals (use with market: india)
+      - "^INDIAVIX"                      # India VIX
+      - "GC=F"                           # Gold (India imports heavily)
+      - "CL=F"                           # Crude Oil (India imports 85%)
+      - "USDINR=X"                       # USD/INR exchange rate
+      - "^NSEI"                          # Nifty 50 index
+      - "^NSEBANK"                       # Bank Nifty
+
+    sector_etfs:                         # US sector ETFs (default)
       - XLK                              # Technology
       - XLF                              # Financials
       - XLE                              # Energy
       - XLV                              # Healthcare
       - XLI                              # Industrials
+
+    sector_india:                        # NSE sector indices (use with market: india)
+      - "^CNXIT"                         # Nifty IT
+      - "^NSEBANK"                       # Nifty Bank
+      - "^CNXAUTO"                       # Nifty Auto
+      - "^CNXPHARMA"                     # Nifty Pharma
+      - "^CNXFMCG"                       # Nifty FMCG
 
   # Columns to keep from yFinance OHLCV download
   price_columns: ["open", "high", "low", "close", "volume"]
@@ -95,6 +123,26 @@ features:
   # Minimum non-NaN rows required after feature engineering
   min_rows_after_engineering: 200
 
+  earnings:
+    enabled: true
+    decay_days: 30                     # earnings surprise signal decays over 30 days
+    surprise_threshold: 0.05           # 5% surprise threshold to flag as significant
+
+  options:
+    enabled: true
+    expiry_windows: [30, 60]           # days to expiry for IV calculation
+    iv_rv_windows: [20, 30]            # windows for IV vs RV spread
+
+  finbert:
+    enabled: false                     # set true if GPU available (slow on CPU)
+    model: "ProsusAI/finbert"
+    batch_size: 32
+    max_length: 512
+    fallback_to_keyword: true          # use keyword scoring if finbert fails
+
+  use_optuna: false                    # set true to run hyperparameter tuning
+  optuna_trials: 100                   # number of trials
+
 # -----------------------------------------------------------------------------
 # Causal discovery
 # Used by: granger.py, pcmci.py, selector.py
@@ -108,8 +156,8 @@ causal:
 
   pcmci:
     tau_min: 1                          # minimum lag (0 = contemporaneous, avoid)
-    tau_max: 5                          # maximum lag in days
-    pc_alpha: 0.05                      # significance for PC condition-selection step
+    tau_max: 3                          # maximum lag in days (3 is sufficient, 5 is slow)
+    pc_alpha: 0.10                      # significance for PC condition-selection step (higher = faster)
     cond_ind_test: "ParCorr"            # ParCorr | GPDC | CMIknn
     alpha_level: 0.01                   # final MCI test significance threshold
 
@@ -195,13 +243,26 @@ model:
 # -----------------------------------------------------------------------------
 evaluation:
 
-  # Market regime definitions
+  # US market regime definitions (default)
   regimes:
     bull:        ["2010-01-01", "2019-12-31"]   # pre-COVID bull run
     covid_crash: ["2020-01-01", "2020-06-30"]   # crash + initial shock
     recovery:    ["2020-07-01", "2021-12-31"]   # stimulus-driven recovery
     rate_hike:   ["2022-01-01", "2022-12-31"]   # Fed tightening cycle
     ai_bull:     ["2023-01-01", "2025-12-31"]   # AI-driven bull run
+
+  # Active regimes — switch to india when running Indian stocks
+  active_market: "us"                         # change to "india" for Nifty
+
+  # India market regime definitions (use with --market india)
+  regimes_india:
+    pre_demonetisation: ["2010-01-01", "2016-10-31"]  # steady bull
+    demonetisation:     ["2016-11-01", "2017-03-31"]  # structural shock
+    recovery_india:     ["2017-04-01", "2019-12-31"]  # post-demo recovery
+    covid_crash:        ["2020-01-01", "2020-06-30"]  # COVID crash
+    recovery_covid:     ["2020-07-01", "2021-12-31"]  # stimulus recovery
+    rate_hike_rbi:      ["2022-01-01", "2023-06-30"]  # RBI tightening
+    current_bull:       ["2023-07-01", "2025-12-31"]  # current bull run
 
   # Walk-forward backtest settings
   backtest:

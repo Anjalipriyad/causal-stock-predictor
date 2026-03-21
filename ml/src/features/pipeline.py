@@ -36,6 +36,9 @@ from ml.src.features.technical import TechnicalFeatures
 from ml.src.features.macro import MacroFeatures
 from ml.src.features.sentiment import SentimentFeatures
 from ml.src.features.sector import SectorFeatures
+from ml.src.features.earnings import EarningsFeatures
+from ml.src.features.options import OptionsFeatures
+from ml.src.features.finbert import FinBERTSentiment
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,9 @@ class FeaturePipeline:
         self.macro     = MacroFeatures(config_path)
         self.sentiment = SentimentFeatures(config_path)
         self.sector    = SectorFeatures(config_path)
+        self.earnings  = EarningsFeatures(config_path)
+        self.options   = OptionsFeatures(config_path)
+        self.finbert   = FinBERTSentiment(config_path)
 
         proc = self.cfg["data"]["processed_dir"]
         self.features_dir = self.root / proc / "features"
@@ -129,11 +135,16 @@ class FeaturePipeline:
         sect_df   = None
         try:
             spy_df  = self.loader.read_macro("^GSPC")
-            # Detect sector ETF for this ticker from config (default XLK)
             sect_df = self.loader.read_macro("XLK")
         except FileNotFoundError:
             pass
         sector_df = self.sector.compute(price_df, spy_df, sect_df)
+
+        # 4c. Earnings features
+        earnings_df = self.earnings.compute(ticker, price_df)
+
+        # 4d. Options IV features (historical proxy)
+        options_df = self.options.compute_historical(ticker, price_df)
 
         # 5. Sentiment features
         if sentiment_df is not None and not sentiment_df.empty:
@@ -145,7 +156,7 @@ class FeaturePipeline:
             )
 
         # 6. Merge on date index
-        df = self._merge(tech_df, macro_df, sent_df, sector_df)
+        df = self._merge(tech_df, macro_df, sent_df, sector_df, earnings_df, options_df)
 
         # 7. Clean up
         df = self._clean(df)
@@ -220,8 +231,18 @@ class FeaturePipeline:
         sector_df = self.sector.compute(price_df, spy_df if not spy_df.empty else None,
                                         sect_df if not sect_df.empty else None)
 
+        # Earnings features (live)
+        earnings_df = self.earnings.compute(ticker, price_df)
+
+        # Options IV features (live — uses current options chain)
+        options_live = self.options.compute_live(ticker, price_df)
+        options_df   = pd.DataFrame(
+            [options_live.iloc[0].to_dict()] * len(tech_df),
+            index=tech_df.index
+        ) if not options_live.empty else None
+
         # Merge
-        df = self._merge(tech_df, macro_df, sent_df, sector_df)
+        df = self._merge(tech_df, macro_df, sent_df, sector_df, earnings_df, options_df)
         df = self._clean(df, live=True)   # live=True: fill NaN, never drop columns
 
         # Drop target column — not available at inference time
@@ -260,6 +281,8 @@ class FeaturePipeline:
         macro_df: pd.DataFrame,
         sent_df: pd.DataFrame,
         sector_df: pd.DataFrame = None,
+        earnings_df: pd.DataFrame = None,
+        options_df: pd.DataFrame = None,
     ) -> pd.DataFrame:
         """
         Merge technical, macro, sentiment, sector on the trading day index.
@@ -276,6 +299,12 @@ class FeaturePipeline:
 
         if sector_df is not None and not sector_df.empty:
             df = df.join(sector_df, how="left")
+
+        if earnings_df is not None and not earnings_df.empty:
+            df = df.join(earnings_df, how="left")
+
+        if options_df is not None and not options_df.empty:
+            df = df.join(options_df, how="left")
 
         # Forward-fill macro + sentiment (gaps on weekends/holidays)
         # Limit to 5 days to avoid propagating stale data across weekends + holidays

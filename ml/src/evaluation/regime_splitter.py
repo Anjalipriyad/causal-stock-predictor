@@ -41,11 +41,20 @@ class RegimeSplitter:
     All date ranges are read from config.yaml — nothing hardcoded.
     """
 
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config_path: Optional[str] = None, market: str = None):
         cfg = _load_config(config_path)
 
-        # Parse regime date ranges from config
-        raw_regimes = cfg["evaluation"]["regimes"]
+        # Auto-detect market from config if not specified
+        if market is None:
+            market = cfg["evaluation"].get("active_market", "us")
+
+        # Use India regimes if market is india, else US regimes
+        if market == "india":
+            raw_regimes = cfg["evaluation"].get("regimes_india", cfg["evaluation"]["regimes"])
+            logger.info("[regime_splitter] Using India regime definitions")
+        else:
+            raw_regimes = cfg["evaluation"]["regimes"]
+
         self.regimes: dict[str, tuple[str, str]] = {}
         for name, dates in raw_regimes.items():
             self.regimes[name] = (dates[0], dates[1])
