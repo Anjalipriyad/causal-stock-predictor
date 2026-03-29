@@ -255,13 +255,16 @@ evaluation:
   active_market: "us"                         # change to "india" for Nifty
 
   # India market regime definitions (use with --market india)
+  # Full coverage: 2008-2024 across 9 distinct regimes
   regimes_india:
-    pre_demonetisation: ["2010-01-01", "2016-10-31"]  # steady bull
-    demonetisation:     ["2016-11-01", "2017-03-31"]  # structural shock
+    # Note: gfc_crash (2008-2009) excluded — insufficient pre-regime training data
+    gfc_recovery:       ["2009-04-01", "2013-12-31"]  # post-GFC recovery + bull
+    pre_demonetisation: ["2014-01-01", "2016-10-31"]  # Modi election bull run
+    demonetisation:     ["2016-11-01", "2017-03-31"]  # demonetisation shock (unique to India)
     recovery_india:     ["2017-04-01", "2019-12-31"]  # post-demo recovery
     covid_crash:        ["2020-01-01", "2020-06-30"]  # COVID crash
-    recovery_covid:     ["2020-07-01", "2021-12-31"]  # stimulus recovery
-    rate_hike_rbi:      ["2022-01-01", "2023-06-30"]  # RBI tightening
+    recovery_covid:     ["2020-07-01", "2021-12-31"]  # stimulus-driven recovery
+    rate_hike_rbi:      ["2022-01-01", "2023-06-30"]  # RBI tightening cycle
     current_bull:       ["2023-07-01", "2025-12-31"]  # current bull run
 
   # Walk-forward backtest settings
