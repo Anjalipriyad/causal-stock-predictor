@@ -113,10 +113,13 @@ def step3_causal_discovery(ticker: str) -> list[str]:
     feat_path = get_feat_path(ticker)
     df        = pd.read_csv(feat_path, index_col=0, parse_dates=True)
 
-    # For NIFTY — use log_return_5d (excess_return vs itself = 0, meaningless)
-    # For US stocks — use excess_return_5d (vs S&P 500 benchmark)
-    target = "log_return_5d" if is_nifty_ticker(ticker) else cfg["model"]["target"]
-    logger.info(f"[causal] Target variable: {target}")
+    # For NIFTY index — use log_return_5d as target (excess_return vs itself = 0)
+    # For individual stocks — use excess_return_5d (vs market benchmark)
+    if is_nifty_ticker(ticker):
+        target = "log_return_5d"
+        logger.info("[causal] NIFTY index detected — using log_return_5d as target")
+    else:
+        target = cfg["model"]["target"]
 
     # Use only training split — prevents test leakage
     train_ratio = cfg["model"]["train_ratio"]
@@ -137,12 +140,10 @@ def step3_causal_discovery(ticker: str) -> list[str]:
     granger_features = granger.get_causal_features(granger_results)
     logger.info(f"Granger done in {elapsed(start)} — {len(granger_features)} causal features")
 
-    # PCMCI — last 30% of training data (more diverse regime mix, no test leakage)
-    # For extended dataset (2008-2024): last 30% covers ~2016-2020
-    # Includes demonetisation + recovery + early COVID = diverse causal signals
-    logger.info("Running PCMCI on last 30% of training data (5-15 mins)...")
+    # PCMCI — last 50% of training data (no test leakage)
+    logger.info("Running PCMCI on last 50% of training data (5-15 mins)...")
     start      = time.time()
-    df_pcmci   = df_train.iloc[-int(len(df_train) * 0.3):]
+    df_pcmci   = df_train.iloc[-int(len(df_train) * 0.5):]
     logger.info(
         f"PCMCI dataset: {len(df_pcmci)} rows "
         f"({df_pcmci.index.min().date()} → {df_pcmci.index.max().date()})"
@@ -156,8 +157,7 @@ def step3_causal_discovery(ticker: str) -> list[str]:
     # Use union for NIFTY (less data = stricter intersection may find 0 features)
     # Use intersection for US stocks (15 years of data = strict selection is fine)
     selector          = CausalSelector()
-    # Use intersection for NIFTY too — union was too loose with extended dataset
-    selector.strategy = "intersection"
+    selector.strategy = "union" if is_nifty_ticker(ticker) else "intersection"
     logger.info(f"[causal] Selection strategy: {selector.strategy}")
     features = selector.select(ticker, granger_results, pcmci_results, save=True)
 
@@ -177,16 +177,14 @@ def step4_train_models(ticker: str, causal_features: list[str]) -> None:
     feat_path = get_feat_path(ticker)
     df        = pd.read_csv(feat_path, index_col=0, parse_dates=True)
 
-    start    = time.time()
-    ensemble = Ensemble()
-
-    # Override target column for NIFTY — uses log_return_5d not excess_return_5d
+    # Override target for NIFTY
     if is_nifty_ticker(ticker):
-        ensemble.target_col = "log_return_5d"
-        for model in [ensemble.lgbm, ensemble.xgb, ensemble.arima]:
-            model.target_col = "log_return_5d"
-        logger.info("[train] NIFTY: overriding target to log_return_5d")
+        cfg = _load_config()
+        cfg["model"]["target"] = "log_return_5d"
+        logger.info("[train] NIFTY: using log_return_5d as target")
 
+    start          = time.time()
+    ensemble       = Ensemble()
     X_test, y_test = ensemble.train_all(df, ticker, causal_features)
     logger.info(f"All models trained in {elapsed(start)}")
 
@@ -261,10 +259,6 @@ def step5_sample_prediction(
                     if len(train_df) < 200:
                         continue
                     fresh = Ensemble()
-                    if is_nifty_ticker(ticker):
-                        fresh.target_col = "log_return_5d"
-                        for model in [fresh.lgbm, fresh.xgb, fresh.arima]:
-                            model.target_col = "log_return_5d"
                     fresh.train_all(train_df, ticker, causal_features)
                     preds = fresh.predict_historical(regime_df, causal_features)
                     if "actual_return" in preds.columns:
@@ -310,9 +304,8 @@ def step5_sample_prediction(
     else:
         print(f"  MODEL REPORT — {ticker}")
         print(f"{'='*W}")
-        print(f"  Live prediction skipped — NIFTY requires real-time NSE data")
-        print(f"  (P/E, P/B, India VIX, Economic Times headlines).")
-        print(f"  See Model Performance below for historical evaluation.")
+        print(f"  Live prediction not available for NIFTY index.")
+        print(f"  Real-time P/E, P/B and news headlines not available.")
     print(f"\n  Causal Features Used ({len(causal_features)}):")
     print(f"    {', '.join(causal_features)}")
     if model_metrics:
