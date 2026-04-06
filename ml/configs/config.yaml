@@ -13,8 +13,8 @@ project:
 # Data — directories + tickers + date ranges
 # -----------------------------------------------------------------------------
 data:
-  start_date: "2010-01-01"               # historical pull start
-  end_date:   "2025-12-31"               # historical pull end
+  start_date: "2010-01-01"               # historical pull start (US stocks)
+  end_date:   "2025-12-31"               # historical pull end   (US stocks)
 
   # Relative to project root
   raw_dir:       "ml/data/raw"           # written once during training
@@ -22,80 +22,71 @@ data:
   processed_dir: "ml/data/processed"     # feature matrices + regime labels
 
   tickers:
-    target:                              # stocks we predict
+    target:                              # US stocks we predict
       - AAPL
       - MSFT
       - GOOGL
 
-    # ── Nifty 50 targets (use with market: india) ──
+    # ── Nifty 50 targets (use with --market india) ─────────────────────────
     target_india:
-      - RELIANCE.NS                      # Reliance Industries
-      - TCS.NS                           # Tata Consultancy Services
-      - INFY.NS                          # Infosys
-      - HDFCBANK.NS                      # HDFC Bank
-      - ICICIBANK.NS                     # ICICI Bank
-      - HINDUNILVR.NS                    # Hindustan Unilever
-      - ITC.NS                           # ITC
-      - SBIN.NS                          # State Bank of India
-      - BAJFINANCE.NS                    # Bajaj Finance
-      - WIPRO.NS                         # Wipro
+      - RELIANCE.NS
+      - TCS.NS
+      - INFY.NS
+      - HDFCBANK.NS
+      - ICICIBANK.NS
+      - HINDUNILVR.NS
+      - ITC.NS
+      - SBIN.NS
+      - BAJFINANCE.NS
+      - WIPRO.NS
 
     macro:                               # US macro signals (default)
-      - "^VIX"                           # CBOE Volatility Index
-      - "^TNX"                           # 10Y US Treasury Yield
-      - "^IRX"                           # 3M US Treasury Yield (for spread)
-      - "DX-Y.NYB"                       # US Dollar Index
-      - "GC=F"                           # Gold Futures
-      - "CL=F"                           # Crude Oil Futures
-      - "^GSPC"                          # S&P 500
+      - "^VIX"
+      - "^TNX"
+      - "^IRX"
+      - "DX-Y.NYB"
+      - "GC=F"
+      - "CL=F"
+      - "^GSPC"
 
-    macro_india:                         # India macro signals (use with market: india)
-      - "^INDIAVIX"                      # India VIX
-      - "GC=F"                           # Gold (India imports heavily)
-      - "CL=F"                           # Crude Oil (India imports 85%)
-      - "USDINR=X"                       # USD/INR exchange rate
-      - "^NSEI"                          # Nifty 50 index
-      - "^NSEBANK"                       # Bank Nifty
+    macro_india:                         # India macro signals (use with --market india)
+      - "^INDIAVIX"
+      - "GC=F"
+      - "CL=F"
+      - "USDINR=X"
+      - "^NSEI"
+      - "^NSEBANK"
 
     sector_etfs:                         # US sector ETFs (default)
-      - XLK                              # Technology
-      - XLF                              # Financials
-      - XLE                              # Energy
-      - XLV                              # Healthcare
-      - XLI                              # Industrials
+      - XLK
+      - XLF
+      - XLE
+      - XLV
+      - XLI
 
-    sector_india:                        # NSE sector indices (use with market: india)
-      - "^CNXIT"                         # Nifty IT
-      - "^NSEBANK"                       # Nifty Bank
-      - "^CNXAUTO"                       # Nifty Auto
-      - "^CNXPHARMA"                     # Nifty Pharma
-      - "^CNXFMCG"                       # Nifty FMCG
+    sector_india:                        # NSE sector indices (use with --market india)
+      - "^CNXIT"
+      - "^NSEBANK"
+      - "^CNXAUTO"
+      - "^CNXPHARMA"
+      - "^CNXFMCG"
 
-  # Columns to keep from yFinance OHLCV download
   price_columns: ["open", "high", "low", "close", "volume"]
-
-  # How many calendar days of history needed to build one live feature vector
-  # Must be > max rolling window used in features (30d vol + 10d sentiment etc.)
   live_lookback_days: 90
 
 # -----------------------------------------------------------------------------
 # Finnhub API
 # -----------------------------------------------------------------------------
 finnhub:
-  api_key:  ${FINNHUB_API_KEY}           # injected from .env — never hardcode
+  api_key:  ${FINNHUB_API_KEY}
   base_url: "https://finnhub.io/api/v1"
-
-  # Historical sentiment: chunk size when iterating date range
-  sentiment_window_days: 30             # Finnhub free tier max window per call
-
-  # Rate limiting — free tier is 60 calls/min
-  request_delay_seconds: 0.5            # sleep between Finnhub calls
-  max_retries: 3                        # retry on 429 / timeout
+  sentiment_window_days: 30
+  request_delay_seconds: 0.5
+  max_retries: 3
   timeout_seconds: 10
 
 # -----------------------------------------------------------------------------
 # Feature engineering
-# Used by: technical.py, macro.py, sentiment.py, pipeline.py
 # -----------------------------------------------------------------------------
 features:
 
@@ -106,86 +97,77 @@ features:
     macd_signal: 9
     bollinger_window: 20
     bollinger_std: 2
-    momentum_windows: [5, 10, 20]       # lookback days for momentum features
-    volatility_windows: [10, 20, 30]    # lookback days for rolling std dev
-    atr_period: 14                      # Average True Range
+    momentum_windows: [5, 10, 20]
+    volatility_windows: [10, 20, 30]
+    atr_period: 14
 
   macro:
-    vix_change_windows: [1, 5]          # 1d and 5d VIX change
-    yield_spread: true                  # compute 10Y - 3M spread
-    cross_asset_returns: true           # daily log returns for all macro tickers
-    macro_rolling_windows: [5, 10]      # rolling mean for macro features
+    vix_change_windows: [1, 5]
+    yield_spread: true
+    cross_asset_returns: true
+    macro_rolling_windows: [5, 10]
 
   sentiment:
-    rolling_windows: [3, 5, 10]        # rolling avg windows for sentiment score
-    buzz_windows: [3, 5]               # rolling avg windows for article count
+    rolling_windows: [3, 5, 10]
+    buzz_windows: [3, 5]
 
-  # Minimum non-NaN rows required after feature engineering
   min_rows_after_engineering: 200
 
   earnings:
     enabled: true
-    decay_days: 30                     # earnings surprise signal decays over 30 days
-    surprise_threshold: 0.05           # 5% surprise threshold to flag as significant
+    decay_days: 30
+    surprise_threshold: 0.05
 
   options:
     enabled: true
-    expiry_windows: [30, 60]           # days to expiry for IV calculation
-    iv_rv_windows: [20, 30]            # windows for IV vs RV spread
+    expiry_windows: [30, 60]
+    iv_rv_windows: [20, 30]
 
   finbert:
-    enabled: false                     # set true if GPU available (slow on CPU)
+    enabled: false
     model: "ProsusAI/finbert"
     batch_size: 32
     max_length: 512
-    fallback_to_keyword: true          # use keyword scoring if finbert fails
+    fallback_to_keyword: true
 
-  use_optuna: false                    # set true to run hyperparameter tuning
-  optuna_trials: 100                   # number of trials
+  use_optuna: false
+  optuna_trials: 100
 
 # -----------------------------------------------------------------------------
 # Causal discovery
-# Used by: granger.py, pcmci.py, selector.py
 # -----------------------------------------------------------------------------
 causal:
 
   granger:
-    max_lag: 5                          # max lag (days) tested
-    significance: 0.05                  # p-value threshold
-    test: "ssr_chi2test"                # ssr_chi2test | ssr_ftest | lrtest | params_ftest
+    max_lag: 5
+    significance: 0.05
+    test: "ssr_chi2test"
 
   pcmci:
-    tau_min: 1                          # minimum lag (0 = contemporaneous, avoid)
-    tau_max: 3                          # maximum lag in days (3 is sufficient, 5 is slow)
-    pc_alpha: 0.10                      # significance for PC condition-selection step (higher = faster)
-    cond_ind_test: "ParCorr"            # ParCorr | GPDC | CMIknn
-    alpha_level: 0.01                   # final MCI test significance threshold
+    tau_min: 1
+    tau_max: 3
+    pc_alpha: 0.10
+    cond_ind_test: "ParCorr"
+    alpha_level: 0.01
 
   selector:
-    # "intersection" = must appear in both PCMCI + Granger (stricter, better for paper)
-    # "union"        = appears in either (more permissive)
     strategy: "intersection"
-    min_causal_features: 3             # abort if fewer than this survive selection
-    max_causal_features: 15            # cap to avoid overfitting
+    min_causal_features: 3
+    max_causal_features: 15
 
 # -----------------------------------------------------------------------------
 # Model training
-# Used by: lgbm_model.py, xgb_model.py, arima_model.py, ensemble.py
 # -----------------------------------------------------------------------------
 model:
 
-  # What we are predicting
-  target: "excess_return_5d"           # 5-day forward excess return (vs SPY)
-  horizon_days: 5                      # must match target definition
+  target: "excess_return_5d"
+  horizon_days: 5
 
-  # Train / val / test split (chronological — no shuffling)
   train_ratio: 0.70
   val_ratio:   0.15
   test_ratio:  0.15
 
-  # Scaler applied to features before training
-  # saved as scaler_{ticker}.pkl — must be reused at inference
-  scaler: "StandardScaler"             # StandardScaler | RobustScaler | None
+  scaler: "StandardScaler"
 
   lgbm:
     n_estimators: 500
@@ -196,10 +178,10 @@ model:
     subsample: 0.8
     subsample_freq: 1
     colsample_bytree: 0.8
-    reg_alpha: 0.1                     # L1 regularisation
-    reg_lambda: 1.0                    # L2 regularisation
-    early_stopping_rounds: 50          # stop if val loss does not improve
-    verbose: -1                        # suppress LightGBM output
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    early_stopping_rounds: 50
+    verbose: -1
 
   xgb:
     n_estimators: 500
@@ -213,82 +195,141 @@ model:
     verbosity: 0
 
   arima:
-    max_p: 5                           # autoarima search range
+    max_p: 5
     max_q: 5
     max_d: 2
-    seasonal: false                    # no seasonality for daily returns
-    information_criterion: "aic"       # aic | bic
+    seasonal: false
+    information_criterion: "aic"
 
   ensemble:
-    # Weights when TFT is NOT available (default)
     weights:
       lgbm:  0.50
       xgb:   0.35
       arima: 0.15
-
-    # Weights when TFT IS available (pytorch-forecasting installed)
     weights_with_tft:
       lgbm:  0.35
       xgb:   0.25
       arima: 0.10
       tft:   0.30
-
-    # Confidence band z-score multiplier
-    # 1.645 = 90% CI | 1.960 = 95% CI | 2.576 = 99% CI
     confidence_z: 1.645
 
 # -----------------------------------------------------------------------------
 # Evaluation + backtesting
-# Used by: metrics.py, regime_splitter.py, backtester.py
 # -----------------------------------------------------------------------------
 evaluation:
 
-  # US market regime definitions (default)
+  # ── US market regimes (default, used when --market us) ───────────────────
   regimes:
-    bull:        ["2010-01-01", "2019-12-31"]   # pre-COVID bull run
-    covid_crash: ["2020-01-01", "2020-06-30"]   # crash + initial shock
-    recovery:    ["2020-07-01", "2021-12-31"]   # stimulus-driven recovery
-    rate_hike:   ["2022-01-01", "2022-12-31"]   # Fed tightening cycle
-    ai_bull:     ["2023-01-01", "2025-12-31"]   # AI-driven bull run
+    bull:        ["2010-01-01", "2019-12-31"]
+    covid_crash: ["2020-01-01", "2020-06-30"]
+    recovery:    ["2020-07-01", "2021-12-31"]
+    rate_hike:   ["2022-01-01", "2022-12-31"]
+    ai_bull:     ["2023-01-01", "2025-12-31"]
 
-  # Active regimes — switch to india when running Indian stocks
-  active_market: "us"                         # change to "india" for Nifty
+  # Active market switch — change to "india" when running Nifty
+  active_market: "us"
 
-  # India market regime definitions (use with --market india)
+  # ── India market regimes (used when --market india) ───────────────────────
+  #
+  # IMPORTANT NOTES ON REGIME DESIGN:
+  #
+  # 1. gfc_crash (2008-2009) is intentionally EXCLUDED from backtesting regimes.
+  #    It only has 266 rows and Option B gives 0 training rows before it starts.
+  #    It exists implicitly as the "seed" training period for gfc_recovery.
+  #    Document this in the paper as a data availability limitation.
+  #
+  # 2. demonetisation (Nov 2016-Feb 2017) has ZERO rows in both the price data
+  #    AND the headlines file. This is a source data collection gap, not a
+  #    loader bug. The RegimeSplitter will find 0 rows and skip it gracefully
+  #    (min_test_samples = 60 enforced in backtester). The regime is kept in
+  #    the config so it appears in regime_stats() and can be documented in
+  #    the paper as a known gap.
+  #
+  # 3. pre_demonetisation ends on 2016-10-28 (last available price row before
+  #    the gap) rather than 2016-10-31 (calendar month end). Using 2016-10-31
+  #    is also fine — the splitter uses loc[start:end] which is date-inclusive.
+  #
+  # 4. Option B train sizes verified:
+  #    gfc_crash:          0 rows  (excluded from backtesting)
+  #    gfc_recovery:       266 rows (below 500 minimum — model unreliable, document in paper)
+  #    pre_demonetisation: 1407 rows (reliable)
+  #    demonetisation:     1778 rows (0 test rows — skipped automatically)
+  #    recovery_india:     1779 rows (reliable)
+  #    covid_crash:        2456 rows (reliable)
+  #    recovery_covid:     2584 rows (reliable)
+  #    rate_hike_rbi:      2818 rows (reliable)
+  #    current_bull:       3206 rows (reliable)
+  #
   regimes_india:
-    pre_demonetisation: ["2010-01-01", "2016-10-31"]  # steady bull
-    demonetisation:     ["2016-11-01", "2017-03-31"]  # structural shock
-    recovery_india:     ["2017-04-01", "2019-12-31"]  # post-demo recovery
-    covid_crash:        ["2020-01-01", "2020-06-30"]  # COVID crash
-    recovery_covid:     ["2020-07-01", "2021-12-31"]  # stimulus recovery
-    rate_hike_rbi:      ["2022-01-01", "2023-06-30"]  # RBI tightening
-    current_bull:       ["2023-07-01", "2025-12-31"]  # current bull run
+    # GFC recovery: Nifty 3060→6364 (+106%) on global QE + FII inflows
+    # DA will be ~0.46 — only 266 training rows precede this regime.
+    # LightGBM needs minimum ~500 rows to be reliable.
+    # This is a DATA AVAILABILITY LIMITATION, not a model problem.
+    # Document explicitly in the paper.
+    gfc_recovery:       ["2009-04-01", "2013-12-31"]
+
+    # Pre-demonetisation bull: Modi election rally, Nifty +39%, VIX avg 15.5
+    # Data gaps in 2014-2015 mean only 371 rows are available IN this regime,
+    # but the 1407 training rows before it are reliable.
+    pre_demonetisation: ["2014-01-01", "2016-10-31"]
+
+    # Demonetisation shock: Modi banned ₹500/₹1000 notes on 8 Nov 2016
+    # ZERO ROWS in both price data and headlines — source collection gap.
+    # RegimeSplitter returns empty DataFrame; backtester skips automatically.
+    # Kept in config for paper documentation purposes only.
+    demonetisation:     ["2016-11-01", "2017-02-28"]
+
+    # Post-demonetisation recovery: market absorbed the shock, GST rollout
+    # Data resumes from 2017-03-01 after the collection gap.
+    # 1779 training rows before this regime — reliable.
+    recovery_india:     ["2017-03-01", "2019-12-31"]
+
+    # COVID crash: Nifty -38% in 6 weeks, India VIX peaked at 79.3
+    # Hardest regime to predict. DA ~0.50 is the honest answer.
+    # Any model claiming >0.60 here is likely leaking close price levels.
+    covid_crash:        ["2020-01-01", "2020-06-30"]
+
+    # Stimulus-driven melt-up: Nifty +64%, P/E peaked at 42
+    # Hard because the market kept rising against fundamental signals.
+    recovery_covid:     ["2020-07-01", "2021-12-31"]
+
+    # RBI rate hike cycle: 250bps to fight inflation, VIX elevated at 23.4
+    # Model performs well here — rate hike regimes have clear causal structure.
+    # (VIX up → market down, yield signals matter)
+    rate_hike_rbi:      ["2022-01-01", "2023-06-30"]
+
+    # Current India bull run: growth story, low VIX 15.4, moderate P/E 22.6
+    # Model's best regime — most similar to training data distribution.
+    current_bull:       ["2023-07-01", "2024-11-01"]
 
   # Walk-forward backtest settings
   backtest:
-    initial_train_years: 3             # minimum years before first test window
-    step_size_months: 3                # roll forward by this many months each step
-    min_test_samples: 60               # skip window if fewer test rows than this
+    initial_train_years: 3
+    step_size_months: 3
+    # Set to 60 — this is the gate that silently drops the demonetisation
+    # regime (0 rows) and the gfc_crash "regime" (excluded from config).
+    # gfc_recovery (1142 rows) passes this gate but the 266 training rows
+    # limitation should be noted separately in the paper.
+    min_test_samples: 60
 
-  # Trading simulation — for Sharpe + drawdown calculation
+  # Trading simulation
   trading:
-    initial_capital: 100000            # USD
-    transaction_cost_bps: 10          # basis points per trade (0.10%)
-    risk_free_rate_annual: 0.04        # 4% annualised — Sharpe denominator
+    initial_capital: 100000
+    transaction_cost_bps: 10
+    risk_free_rate_annual: 0.04
     trading_days_per_year: 252
 
   # Metrics to compute and report
   metrics:
-    - directional_accuracy             # % of correct up/down calls
-    - sharpe_ratio                     # annualised
-    - rmse                             # on log returns
-    - mape                             # on log returns
-    - max_drawdown                     # worst peak-to-trough in test period
-    - calmar_ratio                     # annualised return / max drawdown
+    - directional_accuracy
+    - sharpe_ratio
+    - rmse
+    - mape
+    - max_drawdown
+    - calmar_ratio
 
 # -----------------------------------------------------------------------------
 # Saved model artefacts
-# Used by: all model files + backend/prediction_service.py
 # -----------------------------------------------------------------------------
 saved_models:
   dir: "ml/saved_models"
@@ -302,6 +343,6 @@ saved_models:
 # Logging
 # -----------------------------------------------------------------------------
 logging:
-  level: "INFO"                        # DEBUG | INFO | WARNING | ERROR
+  level: "INFO"
   format: "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
-  log_dir: "ml/logs"                   # set to null to disable file logging
+  log_dir: "ml/logs"

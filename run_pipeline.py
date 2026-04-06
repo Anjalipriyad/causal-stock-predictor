@@ -58,6 +58,36 @@ def get_feat_path(ticker: str):
         return FeaturePipeline().features_dir / f"{ticker}_features.csv"
 
 
+def _print_regime_table(ticker: str, market: str, feat_path: Path) -> None:
+    """
+    Print configured regime definitions (from config) and, if the feature
+    matrix exists, compute and print regime statistics for the data.
+    Always safe to call; errors are logged and do not abort the pipeline.
+    """
+    try:
+        from ml.src.evaluation.regime_splitter import RegimeSplitter
+        import pandas as pd
+
+        splitter = RegimeSplitter(market=market)
+        print("\n  Regime definitions (from config):")
+        for name, (start, end) in splitter.regime_dates.items():
+            print(f"    {name:15s}: {start} → {end}")
+
+        if feat_path.exists():
+            try:
+                df = pd.read_csv(feat_path, index_col=0, parse_dates=True)
+                stats = splitter.regime_stats(df)
+                print("\n  Regime stats (based on feature matrix):")
+                print(stats.to_string())
+            except Exception as e:
+                logger.warning(f"[pipeline] Could not compute regime stats: {e}")
+        else:
+            logger.info("[pipeline] Feature matrix not found — skipping regime stats computation.")
+
+    except Exception as e:
+        logger.warning(f"[pipeline] Could not print regime definitions: {e}")
+
+
 # ── Pipeline steps ────────────────────────────────────────────────────────────
 
 def step1_load_data(ticker: str, skip: bool, market: str = "us") -> None:
@@ -184,7 +214,8 @@ def step4_train_models(ticker: str, causal_features: list[str]) -> None:
         logger.info("[train] NIFTY: using log_return_5d as target")
 
     start          = time.time()
-    ensemble       = Ensemble()
+    # Pass overridden config for NIFTY so the target column is correct
+    ensemble       = Ensemble(cfg=cfg) if is_nifty_ticker(ticker) else Ensemble()
     X_test, y_test = ensemble.train_all(df, ticker, causal_features)
     logger.info(f"All models trained in {elapsed(start)}")
 
@@ -206,11 +237,18 @@ def step5_sample_prediction(
 ) -> None:
     banner(f"STEP 5 — Live Prediction and Model Report ({ticker})")
     import pandas as pd
-    from ml.src.data.loader import DataLoader
+    from ml.src.data.loader import DataLoader, _load_config
     from ml.src.features.pipeline import FeaturePipeline
     from ml.src.ensemble import Ensemble
     from ml.src.evaluation.metrics import Metrics
     from ml.src.evaluation.regime_splitter import RegimeSplitter
+
+    # Determine config override for NIFTY (use log_return_5d instead of excess_return_5d)
+    cfg = None
+    if is_nifty_ticker(ticker) or market == "india":
+        cfg = _load_config()
+        cfg["model"]["target"] = "log_return_5d"
+        logger.info("[train] NIFTY: using log_return_5d as target")
 
     # NIFTY — skip live prediction (no real-time P/E, P/B, headlines available)
     # Live prediction quality would be misleading without the same data quality as training
@@ -258,7 +296,8 @@ def step5_sample_prediction(
                     train_df     = df.loc[:regime_start].iloc[:-1]
                     if len(train_df) < 200:
                         continue
-                    fresh = Ensemble()
+                    # Pass cfg override for NIFTY so per-regime training uses correct target
+                    fresh = Ensemble(cfg=cfg)
                     fresh.train_all(train_df, ticker, causal_features)
                     preds = fresh.predict_historical(regime_df, causal_features)
                     if "actual_return" in preds.columns:
@@ -448,6 +487,9 @@ Examples:
     print(f"    Feature matrix:  {'✓ exists' if skip_feat   else '✗ missing'} {'(skipping)' if skip_feat   else '(will build)'}")
     print(f"    Causal features: {'✓ exists' if skip_causal else '✗ missing'} {'(skipping)' if skip_causal else '(will run PCMCI)'}")
     print(f"    Trained models:  {'✓ exists' if skip_train  else '✗ missing'} {'(skipping)' if skip_train  else '(will train)'}")
+
+    # Always print configured regime definitions and stats (if feature matrix available)
+    _print_regime_table(ticker, args.market, feat_path)
 
     try:
         # Step 1

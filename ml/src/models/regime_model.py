@@ -167,7 +167,7 @@ class RegimeAwareEnsemble:
             )
 
             try:
-                ensemble = Ensemble()
+                ensemble = Ensemble(cfg=self.cfg)
                 X_test, y_test = ensemble.train_all(
                     regime_df, f"{ticker}_{regime_name}", causal_features
                 )
@@ -246,7 +246,7 @@ class RegimeAwareEnsemble:
 
         for regime in meta.get("trained_regimes", []):
             try:
-                ensemble = Ensemble()
+                ensemble = Ensemble(cfg=self.cfg)
                 ensemble.load(f"{ticker}_{regime}")
                 self._regime_ensembles[regime] = ensemble
                 logger.info(f"[regime_model] Loaded {regime} model.")

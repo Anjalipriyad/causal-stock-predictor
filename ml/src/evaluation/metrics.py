@@ -7,13 +7,17 @@ Metrics computed:
     directional_accuracy   — % of correct UP/DOWN calls
     sharpe_ratio           — annualised risk-adjusted return
     rmse                   — root mean squared error on log returns
+    mae                    — mean absolute error on log returns
+    r2_score               — coefficient of determination on log returns
     mape                   — mean absolute percentage error on log returns
     max_drawdown           — worst peak-to-trough equity curve drop
     calmar_ratio           — annualised return / max drawdown
 
-All metrics are computed from:
-    y_pred: pd.Series of predicted log returns
-    y_true: pd.Series of actual log returns
+mae and r2_score are added to match the regression paper's evaluation
+methodology. Note: R² on log returns will typically be low (0.01-0.10 is
+considered good for financial return prediction) — this is normal and
+expected. Do NOT compare to R² scores on raw price levels, which are
+artificially inflated by price level trends.
 
 Usage:
     from ml.src.evaluation.metrics import Metrics
@@ -21,11 +25,6 @@ Usage:
 
     scores = m.compute_all(y_pred, y_true)
     print(scores)
-
-    # Individual metrics
-    da  = m.directional_accuracy(y_pred, y_true)
-    sr  = m.sharpe_ratio(y_pred)
-    mdd = m.max_drawdown(y_pred)
 """
 
 import logging
@@ -67,17 +66,10 @@ class Metrics:
     ) -> dict[str, float]:
         """
         Compute all configured metrics and return as a dict.
-
-        Args:
-            y_pred: Predicted log returns (aligned index with y_true)
-            y_true: Actual log returns
-            label:  Optional label for logging (e.g. regime name)
-
-        Returns:
-            Dict: metric_name → float value
+        Also always includes mae and r2_score regardless of config,
+        as these are required for the regression paper evaluation.
         """
         y_pred, y_true = self._align(y_pred, y_true)
-
         scores = {}
 
         if "directional_accuracy" in self.metrics_list:
@@ -88,6 +80,10 @@ class Metrics:
 
         if "rmse" in self.metrics_list:
             scores["rmse"] = self.rmse(y_pred, y_true)
+
+        # MAE and R² always included (required for regression paper)
+        scores["mae"]      = self.mae(y_pred, y_true)
+        scores["r2_score"] = self.r2_score(y_pred, y_true)
 
         if "mape" in self.metrics_list:
             scores["mape"] = self.mape(y_pred, y_true)
@@ -114,10 +110,8 @@ class Metrics:
     ) -> float:
         """
         Percentage of predictions with correct UP/DOWN direction.
-        Random baseline = 0.50.
-        Anything above 0.55 consistently is meaningful.
-
-        Returns: float in [0, 1]
+        Random baseline = 0.50. Anything above 0.55 consistently is meaningful.
+        Returns float in [0, 1].
         """
         y_pred, y_true = self._align(y_pred, y_true)
         correct = ((y_pred >= 0) == (y_true >= 0)).sum()
@@ -130,36 +124,19 @@ class Metrics:
     ) -> float:
         """
         Annualised Sharpe ratio of a simple long/short strategy.
-
-        Strategy:
-            - Go LONG  (return = actual return)  when prediction is UP
-            - Go SHORT (return = -actual return) when prediction is DOWN
-            - Apply transaction cost on every trade
-
-        Sharpe = (mean_daily_return - daily_rf) / std_daily_return * sqrt(252)
-
-        Returns: float (can be negative)
+        Strategy: LONG when prediction is UP, SHORT when DOWN.
+        Transaction cost applied on every prediction period.
+        Returns float (can be negative).
         """
         y_pred, y_true = self._align(y_pred, y_true)
-
-        # Strategy returns
-        positions   = np.where(y_pred >= 0, 1, -1)
-        strat_rets  = positions * y_true
-
-        # Apply transaction cost (bps converted to decimal)
-        tx_cost     = self.tx_cost_bps / 10_000
-        # Cost on every day (simple approximation — cost each prediction period)
-        strat_rets  = strat_rets - tx_cost
-
-        daily_rf    = self.risk_free_rate / self.trading_days
-        excess_rets = strat_rets - daily_rf
-        std         = strat_rets.std()
-
+        positions  = np.where(y_pred >= 0, 1, -1)
+        strat_rets = positions * y_true - (self.tx_cost_bps / 10_000)
+        daily_rf   = self.risk_free_rate / self.trading_days
+        excess     = strat_rets - daily_rf
+        std        = strat_rets.std()
         if std == 0 or np.isnan(std):
             return 0.0
-
-        sharpe = (excess_rets.mean() / std) * np.sqrt(self.trading_days)
-        return float(sharpe)
+        return float((excess.mean() / std) * np.sqrt(self.trading_days))
 
     def rmse(
         self, y_pred: pd.Series, y_true: pd.Series
@@ -167,11 +144,50 @@ class Metrics:
         """
         Root Mean Squared Error on log returns.
         Lower is better. Heavily penalises large errors.
-
-        Returns: float >= 0
+        Returns float >= 0.
         """
         y_pred, y_true = self._align(y_pred, y_true)
         return float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
+
+    def mae(
+        self, y_pred: pd.Series, y_true: pd.Series
+    ) -> float:
+        """
+        Mean Absolute Error on log returns.
+        Average magnitude of prediction error.
+        Less sensitive to large outliers than RMSE.
+        Returns float >= 0.
+
+        Interpretation for Nifty:
+            If log return is ~0.01 (1%) daily, MAE of 0.005 means the model
+            is off by about 0.5% on average — roughly half a percent per day.
+        """
+        y_pred, y_true = self._align(y_pred, y_true)
+        return float(np.mean(np.abs(y_pred - y_true)))
+
+    def r2_score(
+        self, y_pred: pd.Series, y_true: pd.Series
+    ) -> float:
+        """
+        R² (coefficient of determination) on log returns.
+
+        Values:
+            1.0  = perfect prediction
+            0.0  = model is no better than predicting the mean
+            <0.0 = model is worse than predicting the mean
+
+        IMPORTANT: R² on LOG RETURNS is expected to be low (0.01-0.10 is good).
+        This is normal for financial return prediction — returns have very low
+        signal-to-noise. Do NOT compare this R² to values from price-level
+        regression (which are artificially inflated by price trends and would
+        be ~0.99 for any naive model).
+        """
+        y_pred, y_true = self._align(y_pred, y_true)
+        ss_res = np.sum((y_true - y_pred) ** 2)
+        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+        if ss_tot == 0:
+            return 0.0
+        return float(1 - ss_res / ss_tot)
 
     def mape(
         self, y_pred: pd.Series, y_true: pd.Series,
@@ -180,61 +196,41 @@ class Metrics:
         """
         Mean Absolute Percentage Error on log returns.
         Uses epsilon to avoid division by zero on near-zero returns.
-
-        Returns: float >= 0 (as a ratio, not %)
+        Returns float >= 0 (as a ratio, not %).
         """
         y_pred, y_true = self._align(y_pred, y_true)
         denom = np.abs(y_true) + epsilon
         return float(np.mean(np.abs(y_pred - y_true) / denom))
 
     def max_drawdown(
-        self,
-        y_pred: pd.Series,
-        y_true: pd.Series,
+        self, y_pred: pd.Series, y_true: pd.Series,
     ) -> float:
         """
         Maximum drawdown of the long/short strategy equity curve.
-        Measures worst peak-to-trough drop in cumulative returns.
-
-        Returns: float in [-1, 0] (negative — drawdown is a loss)
+        Returns float in [-1, 0] (negative — drawdown is a loss).
         """
         y_pred, y_true = self._align(y_pred, y_true)
-
         positions  = np.where(y_pred >= 0, 1, -1)
         strat_rets = positions * y_true
-
-        # Cumulative equity curve
-        equity = (1 + strat_rets).cumprod()
-        peak   = equity.cummax()
-        dd     = (equity - peak) / peak
-
+        equity     = (1 + strat_rets).cumprod()
+        peak       = equity.cummax()
+        dd         = (equity - peak) / peak
         return float(dd.min())
 
     def calmar_ratio(
-        self,
-        y_pred: pd.Series,
-        y_true: pd.Series,
+        self, y_pred: pd.Series, y_true: pd.Series,
     ) -> float:
         """
         Calmar ratio = annualised return / abs(max drawdown).
-        Measures return per unit of drawdown risk.
-        Higher is better.
-
-        Returns: float (can be negative if strategy loses money)
+        Higher is better. Returns float (can be negative).
         """
         y_pred, y_true = self._align(y_pred, y_true)
-
-        positions  = np.where(y_pred >= 0, 1, -1)
-        strat_rets = positions * y_true
-
-        # Annualised return
-        mean_daily    = strat_rets.mean()
-        annual_return = mean_daily * self.trading_days
-
-        mdd = abs(self.max_drawdown(y_pred, y_true))
+        positions      = np.where(y_pred >= 0, 1, -1)
+        strat_rets     = positions * y_true
+        annual_return  = strat_rets.mean() * self.trading_days
+        mdd            = abs(self.max_drawdown(y_pred, y_true))
         if mdd == 0:
             return 0.0
-
         return float(annual_return / mdd)
 
     # -----------------------------------------------------------------------
@@ -248,32 +244,17 @@ class Metrics:
         """
         Build a comparison table of metrics across multiple models/regimes.
         This is Table 2 in the paper.
-
-        Args:
-            results: {model_or_regime_name: {metric: value}}
-                     e.g. {
-                         "all_features":  {"directional_accuracy": 0.54, ...},
-                         "granger":       {"directional_accuracy": 0.55, ...},
-                         "pcmci_causal":  {"directional_accuracy": 0.57, ...},
-                     }
-
-        Returns:
-            DataFrame with models as rows, metrics as columns.
         """
         df = pd.DataFrame(results).T
         df.index.name = "model"
-
-        # Format percentages for readability
-        pct_cols = ["directional_accuracy", "max_drawdown"]
+        pct_cols   = ["directional_accuracy", "max_drawdown"]
+        float_cols = ["sharpe_ratio", "calmar_ratio", "rmse", "mae", "r2_score", "mape"]
         for col in pct_cols:
             if col in df.columns:
                 df[col] = df[col].map(lambda x: f"{x:.1%}")
-
-        float_cols = ["sharpe_ratio", "calmar_ratio", "rmse", "mape"]
         for col in float_cols:
             if col in df.columns:
-                df[col] = df[col].map(lambda x: f"{x:.3f}")
-
+                df[col] = df[col].map(lambda x: f"{x:.4f}")
         return df
 
     # -----------------------------------------------------------------------
@@ -288,7 +269,6 @@ class Metrics:
             y_pred = pd.Series(y_pred)
         if isinstance(y_true, np.ndarray):
             y_true = pd.Series(y_true)
-
         combined = pd.concat([y_pred, y_true], axis=1).dropna()
         return combined.iloc[:, 0], combined.iloc[:, 1]
 
@@ -296,8 +276,6 @@ class Metrics:
         """
         Compute expected metrics for a random direction predictor.
         Useful for establishing statistical significance in the paper.
-
-        Returns: {metric: mean_value, metric_std: std_value}
         """
         rng    = np.random.default_rng(42)
         scores = []
@@ -307,10 +285,8 @@ class Metrics:
                 index=y_true.index,
             )
             scores.append(self.compute_all(y_random, y_true))
-
         result = {}
-        keys   = scores[0].keys()
-        for k in keys:
+        for k in scores[0].keys():
             vals = [s[k] for s in scores]
             result[f"{k}_mean"] = float(np.mean(vals))
             result[f"{k}_std"]  = float(np.std(vals))

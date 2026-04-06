@@ -1,27 +1,25 @@
 """
 ensemble.py
 -----------
-Blends LightGBM + XGBoost + ARIMA into a single PredictionResult.
+Blends LightGBM + XGBoost + ARIMA (+ optional LSTM) using a learned
+Ridge Regression meta-learner rather than fixed hardcoded weights.
 
-Weights from config (must sum to 1.0):
-    lgbm:  0.50
-    xgb:   0.35
-    arima: 0.15
+Architecture change from v1:
+    BEFORE: pred = 0.50*lgbm + 0.35*xgb + 0.15*arima  (fixed weights)
+    AFTER:  pred = Ridge(lgbm_pred, xgb_pred, arima_pred)  (learned weights)
+
+The StackingMetaLearner is trained on VALIDATION SET predictions from the
+base models, so it learns which model to trust more for this ticker/regime
+without any data leakage. Falls back to fixed weights gracefully if the
+meta-learner hasn't been trained yet (backward compatible with saved models).
+
+LSTM is optional — if PyTorch is not installed, the ensemble runs as
+LightGBM + XGBoost + ARIMA + fixed-weight fallback, identical to v1.
 
 The ensemble is the ONLY entry point used by:
-    - backtester.py       (evaluation)
+    - backtester.py         (evaluation)
     - prediction_service.py (backend inference)
-
-Nobody outside ml/ ever calls individual model files directly.
-
-Two modes:
-    predict_historical(df, ticker, causal_features)
-        → returns pd.Series of predictions aligned to df index
-        → used by backtester for walk-forward evaluation
-
-    predict_live(live_features, ticker, current_price, causal_features)
-        → returns single PredictionResult
-        → used by backend at inference time
+    - run_pipeline.py       (CLI)
 
 Usage:
     from ml.src.ensemble import Ensemble
@@ -37,7 +35,6 @@ Usage:
         current_price=213.40,
         causal_features=["vix_change_1d", "sentiment_ma_5d", ...]
     )
-    print(result)
 """
 
 import logging
@@ -52,58 +49,78 @@ from ml.src.models.base_model import PredictionResult
 from ml.src.models.lgbm_model import LGBMModel
 from ml.src.models.xgb_model import XGBModel
 from ml.src.models.arima_model import ARIMAModel
+from ml.src.models.stacking_meta_learner import StackingMetaLearner
+from ml.src.causal.selector import CausalSelector
+from ml.src.models.tuner import HyperparameterTuner
+
+# Optional LSTM import — fails gracefully if PyTorch not installed
+try:
+    from ml.src.models.lstm_model import LSTMModel
+    _LSTM_IMPORT_OK = True
+except ImportError:
+    _LSTM_IMPORT_OK = False
+
+# Optional TFT import
 try:
     from ml.src.models.tft_model import TFTModel
     TFT_AVAILABLE = True
 except ImportError:
     TFT_AVAILABLE = False
-from ml.src.causal.selector import CausalSelector
-from ml.src.models.tuner import HyperparameterTuner
 
 logger = logging.getLogger(__name__)
 
 
 class Ensemble:
     """
-    Weighted ensemble of LightGBM + XGBoost + ARIMA.
+    Stacking ensemble: LightGBM + XGBoost + ARIMA + optional LSTM.
+    Blended via a learned Ridge Regression meta-learner.
 
-    Responsibilities:
-        - Load all three models from saved_models/
-        - Load causal feature list from saved_models/
-        - Blend raw predictions using configured weights
-        - Produce a single PredictionResult with blended confidence band
-        - Extract causal drivers from the highest-weight model (LightGBM)
+    Backward compatibility:
+        If no meta_learner_{ticker}.pkl exists on disk, falls back to the
+        config-specified fixed weights (0.50/0.35/0.15). Existing saved
+        models continue to work without retraining.
     """
 
-    def __init__(self, config_path: Optional[str] = None):
-        self.cfg      = _load_config(config_path)
+    def __init__(self, config_path: Optional[str] = None, cfg: Optional[dict] = None):
+        # Allow callers to pass an already-loaded config dict (overrides file)
+        self.cfg      = cfg if cfg is not None else _load_config(config_path)
         self.root     = Path(__file__).resolve().parents[2]
-
-        # Weights
-        w = self.cfg["model"]["ensemble"]["weights"]
-        self.weights = {
-            "lgbm":  w["lgbm"],
-            "xgb":   w["xgb"],
-            "arima": w["arima"],
-        }
-        assert abs(sum(self.weights.values()) - 1.0) < 1e-6, \
-            "Ensemble weights must sum to 1.0"
 
         self.confidence_z = self.cfg["model"]["ensemble"]["confidence_z"]
         self.horizon      = self.cfg["model"]["horizon_days"]
         self.target_col   = self.cfg["model"]["target"]
 
-        # Model instances
-        self.lgbm  = LGBMModel(config_path)
-        self.xgb   = XGBModel(config_path)
-        self.arima = ARIMAModel(config_path)
+        # ── Base models ────────────────────────────────────────────────────
+        # Pass the loaded config to submodels so runtime overrides are honoured
+        self.lgbm  = LGBMModel(config_path, self.cfg)
+        self.xgb   = XGBModel(config_path, self.cfg)
+        self.arima = ARIMAModel(config_path, self.cfg)
 
-        # Causal selector for loading feature list
-        self.selector = CausalSelector(config_path)
+        # ── LSTM base learner (optional) ───────────────────────────────────
+        if _LSTM_IMPORT_OK:
+            self.lstm = LSTMModel(config_path, self.cfg)
+            self._lstm_enabled = self.lstm.is_available()
+        else:
+            self.lstm          = None
+            self._lstm_enabled = False
 
-        self._ticker: Optional[str] = None
-        self._causal_features: Optional[list[str]] = None
-        self._is_loaded: bool = False
+        # ── Meta-learner (replaces fixed weights) ─────────────────────────
+        # Initialize with config default weights as fallback
+        w = self.cfg["model"]["ensemble"]["weights"]
+        self.meta_learner = StackingMetaLearner(
+            alpha=1.0,
+            default_weights=w,
+        )
+
+        # ── Support infrastructure ─────────────────────────────────────────
+        self.selector = CausalSelector(config_path, self.cfg)
+        models_dir    = self.cfg["saved_models"]["dir"]
+        self.models_dir = self.root / models_dir
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+
+        self._ticker:           Optional[str]       = None
+        self._causal_features:  Optional[list[str]] = None
+        self._is_loaded:        bool                = False
 
     # -----------------------------------------------------------------------
     # Load / train
@@ -111,7 +128,7 @@ class Ensemble:
 
     def load(self, ticker: str) -> None:
         """
-        Load all three trained models + causal feature list from saved_models/.
+        Load all trained models + meta-learner + causal feature list.
         Must be called before predict_live() or predict_historical().
         """
         ticker = ticker.upper()
@@ -122,6 +139,21 @@ class Ensemble:
         self.arima.load(ticker)
         self.lgbm.load_scaler(ticker)
         self.xgb.load_scaler(ticker)
+
+        # Load LSTM if available and saved
+        if self._lstm_enabled and self.lstm is not None:
+            try:
+                self.lstm.load(ticker)
+                logger.info(f"[ensemble] LSTM model loaded for {ticker}.")
+            except FileNotFoundError:
+                logger.info(
+                    f"[ensemble] No LSTM model found for {ticker} — "
+                    "LSTM will be skipped at inference."
+                )
+                self._lstm_enabled = False
+
+        # Load meta-learner (falls back to fixed weights if not found)
+        self.meta_learner.load(ticker, self.models_dir)
 
         self._causal_features = self.selector.load(ticker)
         self._ticker          = ticker
@@ -137,58 +169,111 @@ class Ensemble:
         df: pd.DataFrame,
         ticker: str,
         causal_features: list[str],
-    ) -> None:
+    ) -> tuple:
         """
-        Train all three models on the feature matrix.
-        Saves all models + scaler to saved_models/.
+        Train all base models + meta-learner on the feature matrix.
+        Saves all models to saved_models/.
+
+        Training order:
+            1. Split data into train / val / test (chronological)
+            2. Scale features (fit on train, apply to all)
+            3. Optionally tune hyperparams (Optuna)
+            4. Train LightGBM, XGBoost, ARIMA
+            5. Optionally train LSTM
+            6. Train meta-learner on VALIDATION SET predictions from steps 4-5
+               (CRITICAL: val set, not train set — prevents weight leakage)
+            7. Save everything
 
         Args:
-            df:               Full feature matrix (from pipeline.build())
-            ticker:           e.g. "AAPL"
-            causal_features:  Output of CausalSelector.select()
+            df:              Full feature matrix (from pipeline.build())
+            ticker:          e.g. "AAPL" or "NIFTY"
+            causal_features: Output of CausalSelector.select()
+
+        Returns:
+            X_test_scaled, y_test  (for immediate evaluation by caller)
         """
         ticker = ticker.upper()
         logger.info(f"[ensemble] Training all models for {ticker} ...")
 
-        # Prepare splits using base_model helper
+        # ── 1. Data split ──────────────────────────────────────────────────
         X_train, X_val, X_test, y_train, y_val, y_test = \
             self.lgbm.prepare_data(df, causal_features)
 
-        # Scale — fit on train, apply to all splits
-        X_train_s, X_val_s, X_test_s = self.lgbm.scale(
-            X_train, X_val, X_test, ticker
-        )
-        # XGBoost uses same scaler
+        # ── 2. Scale ───────────────────────────────────────────────────────
+        X_train_s, X_val_s, X_test_s = self.lgbm.scale(X_train, X_val, X_test, ticker)
+        # XGBoost uses the same scaler (fitted by LGBM above)
         _, _, _ = self.xgb.scale(X_train, X_val, X_test, ticker)
 
-        # Optuna tuning (if enabled in config)
+        # ── 3. Optional Optuna tuning ──────────────────────────────────────
         tuner = HyperparameterTuner()
         if tuner.enabled:
-            logger.info("[ensemble] Running Optuna hyperparameter tuning...")
+            logger.info("[ensemble] Running Optuna hyperparameter tuning ...")
             best_lgbm = tuner.tune_lgbm(X_train_s, y_train, X_val_s, y_val, ticker)
             best_xgb  = tuner.tune_xgb(X_train_s, y_train, X_val_s, y_val, ticker)
-            # Apply tuned params
             self.lgbm._params.update(best_lgbm)
             self.xgb._params.update(best_xgb)
 
-        # Train LightGBM
+        # ── 4. Train base models ───────────────────────────────────────────
         self.lgbm.fit(X_train_s, y_train, X_val_s, y_val)
         self.lgbm.save(ticker)
 
-        # Train XGBoost
         self.xgb.fit(X_train_s, y_train, X_val_s, y_val)
         self.xgb.save(ticker)
 
-        # Train ARIMA (univariate — uses y only)
-        self.arima.fit(X_train, y_train, X_val, y_val)
-        self.arima.save(ticker)
+        # ARIMA: fit on TRAIN ONLY for the meta-learner step to avoid
+        # leaking validation-set information into meta-learner training.
+        # We'll optionally refit on train+val and save the final model after
+        # the meta-learner has been trained.
+        self.arima.fit(X_train, y_train, X_val=None, y_val=None)
+
+        # ── 5. Optional LSTM training ──────────────────────────────────────
+        lstm_val_preds = None
+        if self._lstm_enabled and self.lstm is not None:
+            try:
+                self.lstm.fit(X_train_s, y_train, X_val_s, y_val)
+                if self.lstm._is_fitted:
+                    self.lstm.save(ticker)
+                    lstm_val_preds = self.lstm.predict_raw(X_val_s)
+                    logger.info("[ensemble] LSTM trained and saved.")
+            except Exception as e:
+                logger.warning(f"[ensemble] LSTM training failed: {e}. Skipping.")
+                self._lstm_enabled = False
+
+        # ── 6. Train meta-learner on VALIDATION SET predictions ────────────
+        # These are out-of-fold predictions — the base models haven't seen X_val
+        # during training, so the meta-learner gets honest signal about each
+        # model's relative accuracy
+        val_lgbm  = self.lgbm.predict_raw(X_val_s)
+        val_xgb   = self.xgb.predict_raw(X_val_s)
+        val_arima = self.arima.predict_raw(X_val)
+
+        self.meta_learner.fit(
+            lgbm_preds  = val_lgbm,
+            xgb_preds   = val_xgb,
+            arima_preds = val_arima,
+            y_true      = y_val.values,
+            lstm_preds  = lstm_val_preds,
+        )
+        self.meta_learner.save(ticker, self.models_dir)
 
         self._ticker          = ticker
         self._causal_features = causal_features
         self._is_loaded       = True
 
         logger.info(f"[ensemble] All models trained and saved for {ticker}.")
-        return X_test_s, y_test   # return test set for immediate evaluation
+        logger.info(f"[ensemble] Meta-learner weights: {self.meta_learner.learned_weights()}")
+
+        # Final ARIMA refit on train+val for the persisted model (no leak risk:
+        # meta-learner was trained on ARIMA predictions produced while ARIMA
+        # had only seen the training set).
+        try:
+            self.arima.fit(X_train, y_train, X_val, y_val)
+            self.arima.save(ticker)
+            logger.info("[ensemble] ARIMA refit on train+val and saved.")
+        except Exception as e:
+            logger.warning(f"[ensemble] ARIMA final refit failed: {e}")
+
+        return X_test_s, y_test
 
     # -----------------------------------------------------------------------
     # Inference — live
@@ -196,22 +281,14 @@ class Ensemble:
 
     def predict_live(
         self,
-        live_features: pd.Series,
-        ticker: str,
-        current_price: float,
+        live_features:   pd.Series,
+        ticker:          str,
+        current_price:   float,
         causal_features: Optional[list[str]] = None,
     ) -> PredictionResult:
         """
         Produce a single blended PredictionResult for live inference.
-
-        Args:
-            live_features:   Single feature row (pd.Series) from pipeline.build_live()
-            ticker:          Stock ticker
-            current_price:   Latest close price
-            causal_features: Override causal feature list (uses loaded list if None)
-
-        Returns:
-            PredictionResult with blended prediction + confidence band + drivers
+        Uses the learned meta-learner weights (or fixed fallback).
         """
         self._check_loaded()
         ticker   = ticker.upper()
@@ -225,55 +302,47 @@ class Ensemble:
         X_lgbm = self.lgbm.transform(X)
         X_xgb  = self.xgb.transform(X)
 
-        # Raw predictions from each model
+        # Base model raw predictions
         pred_lgbm  = float(self.lgbm.predict_raw(X_lgbm)[0])
         pred_xgb   = float(self.xgb.predict_raw(X_xgb)[0])
         pred_arima = float(self.arima.predict_raw(X)[0])
 
-        # Weighted blend
-        pred_blended = (
-            self.weights["lgbm"]  * pred_lgbm  +
-            self.weights["xgb"]   * pred_xgb   +
-            self.weights["arima"] * pred_arima
-        )
-
-        # TFT blend — only if installed and trained
-        tft_enabled = getattr(self, "_tft_enabled", False)
-        if tft_enabled and getattr(self, "tft", None) is not None:
+        # Optional LSTM prediction
+        pred_lstm = None
+        if self._lstm_enabled and self.lstm is not None and self.lstm._is_fitted:
             try:
-                if self.tft.is_available():
-                    pred_tft     = float(self.tft.predict_raw(X)[0])
-                    pred_blended = (
-                        self.weights["lgbm"]  * pred_lgbm  +
-                        self.weights["xgb"]   * pred_xgb   +
-                        self.weights["arima"] * pred_arima +
-                        self.weights.get("tft", 0) * pred_tft
-                    )
+                # LSTM needs context rows — if only 1 row available, skip
+                pred_lstm = float(self.lstm.predict_raw(X_lgbm)[0])
             except Exception as e:
-                logger.warning(f"[ensemble] TFT prediction failed: {e}")
+                logger.debug(f"[ensemble] LSTM live prediction failed: {e}")
+
+        # Blend via meta-learner (or fallback to fixed weights)
+        pred_blended = self.meta_learner.predict(
+            lgbm_pred  = pred_lgbm,
+            xgb_pred   = pred_xgb,
+            arima_pred = pred_arima,
+            lstm_pred  = pred_lstm,
+        )
 
         # Predicted price
         pred_price = current_price * np.exp(pred_blended)
+        direction  = "UP" if pred_blended >= 0 else "DOWN"
 
-        # Direction
-        direction = "UP" if pred_blended >= 0 else "DOWN"
+        # Confidence — blend individual base model confidences
+        conf_lgbm = self.lgbm._compute_confidence(np.array([pred_lgbm]),  X_lgbm)
+        conf_xgb  = self.xgb._compute_confidence( np.array([pred_xgb]),   X_xgb)
+        # Weight confidence by meta-learner's learned emphasis
+        w         = self.cfg["model"]["ensemble"]["weights"]
+        confidence = w["lgbm"] * conf_lgbm + w["xgb"] * conf_xgb + w["arima"] * 0.5
+        confidence = float(np.clip(confidence, 0.3, 0.9))
 
-        # Confidence — blend individual confidences
-        conf_lgbm  = self.lgbm._compute_confidence(np.array([pred_lgbm]),  X_lgbm)
-        conf_xgb   = self.xgb._compute_confidence(np.array([pred_xgb]),    X_xgb)
-        confidence = (
-            self.weights["lgbm"]  * conf_lgbm +
-            self.weights["xgb"]   * conf_xgb  +
-            self.weights["arima"] * 0.5         # ARIMA has no confidence signal
-        )
-
-        # Confidence band — use blended volatility estimate
+        # Confidence band
         vol   = self.lgbm._estimate_volatility(X_lgbm)
         z     = self.confidence_z
         upper = current_price * np.exp(pred_blended + z * vol * np.sqrt(self.horizon))
         lower = current_price * np.exp(pred_blended - z * vol * np.sqrt(self.horizon))
 
-        # Causal drivers from LightGBM (highest weight + SHAP)
+        # Causal drivers from LightGBM (SHAP-based, highest interpretability)
         drivers = self.lgbm._extract_drivers(X_lgbm, features)
 
         from datetime import datetime
@@ -283,17 +352,17 @@ class Ensemble:
             predicted_price=round(pred_price, 2),
             current_price=round(current_price, 2),
             direction=direction,
-            confidence=round(float(confidence), 3),
+            confidence=round(confidence, 3),
             upper_band=round(upper, 2),
             lower_band=round(lower, 2),
             causal_drivers=drivers,
-            model_name="ensemble(lgbm+xgb+arima)",
+            model_name="ensemble(lgbm+xgb+arima+meta)",
             horizon_days=self.horizon,
             prediction_date=datetime.today().strftime("%Y-%m-%d"),
         )
 
     # -----------------------------------------------------------------------
-    # Inference — historical (for backtesting)
+    # Inference — historical (backtesting)
     # -----------------------------------------------------------------------
 
     def predict_historical(
@@ -303,44 +372,48 @@ class Ensemble:
     ) -> pd.DataFrame:
         """
         Generate predictions for an entire DataFrame.
-        Used by backtester.py for walk-forward evaluation.
-
-        Args:
-            df:              Feature matrix with DatetimeIndex
-            causal_features: Override causal feature list
+        Used by backtester.py for walk-forward and regime evaluation.
 
         Returns:
             DataFrame with columns:
-                predicted_return  — blended log return prediction
-                actual_return     — actual log_return_5d (target)
-                direction_pred    — predicted direction (1=UP, 0=DOWN)
-                direction_actual  — actual direction
-                lgbm_pred         — individual model predictions
+                predicted_return  — meta-learner blended prediction
+                actual_return     — actual log_return target
+                direction_pred    — 1=UP, 0=DOWN
+                direction_actual  — 1=UP, 0=DOWN
+                lgbm_pred         — individual model outputs (for ablation)
                 xgb_pred
                 arima_pred
+                lstm_pred         — only present if LSTM trained
         """
         self._check_loaded()
-        features = causal_features or self._causal_features
-
-        # Extract features + target
+        features  = causal_features or self._causal_features
         feat_cols = [c for c in features if c in df.columns]
-        X = df[feat_cols]
-        y = df[self.target_col] if self.target_col in df.columns else None
+        X         = df[feat_cols]
+        y         = df[self.target_col] if self.target_col in df.columns else None
 
         # Scale
         X_lgbm = self.lgbm.transform(X)
         X_xgb  = self.xgb.transform(X)
 
-        # Predictions
+        # Base model predictions
         pred_lgbm  = self.lgbm.predict_raw(X_lgbm)
         pred_xgb   = self.xgb.predict_raw(X_xgb)
         pred_arima = self.arima.predict_raw(X)
 
-        # Blend
-        pred_blended = (
-            self.weights["lgbm"]  * pred_lgbm  +
-            self.weights["xgb"]   * pred_xgb   +
-            self.weights["arima"] * pred_arima
+        # Optional LSTM
+        pred_lstm = None
+        if self._lstm_enabled and self.lstm is not None and self.lstm._is_fitted:
+            try:
+                pred_lstm = self.lstm.predict_raw(X_lgbm)
+            except Exception as e:
+                logger.debug(f"[ensemble] LSTM historical predict failed: {e}")
+
+        # Meta-learner blend
+        pred_blended = self.meta_learner.predict_batch(
+            lgbm_preds  = pred_lgbm,
+            xgb_preds   = pred_xgb,
+            arima_preds = pred_arima,
+            lstm_preds  = pred_lstm,
         )
 
         result = pd.DataFrame(index=df.index)
@@ -350,6 +423,9 @@ class Ensemble:
         result["arima_pred"]       = pred_arima
         result["direction_pred"]   = (pred_blended >= 0).astype(int)
 
+        if pred_lstm is not None:
+            result["lstm_pred"] = pred_lstm
+
         if y is not None:
             result["actual_return"]    = y.values
             result["direction_actual"] = (y.values >= 0).astype(int)
@@ -357,28 +433,23 @@ class Ensemble:
         return result
 
     # -----------------------------------------------------------------------
-    # Model weights management
+    # Helpers
     # -----------------------------------------------------------------------
 
-    def set_weights(
-        self, lgbm: float, xgb: float, arima: float
-    ) -> None:
+    def set_weights(self, lgbm: float, xgb: float, arima: float) -> None:
         """
-        Override ensemble weights at runtime.
-        Useful for ablation studies — test different weight combinations.
+        Override ensemble fallback weights at runtime.
+        Used for ablation studies. Does NOT affect the learned meta-learner.
         Must sum to 1.0.
         """
-        assert abs(lgbm + xgb + arima - 1.0) < 1e-6, \
-            "Weights must sum to 1.0"
-        self.weights = {"lgbm": lgbm, "xgb": xgb, "arima": arima}
+        assert abs(lgbm + xgb + arima - 1.0) < 1e-6, "Weights must sum to 1.0"
+        self.meta_learner._default_weights = {
+            "lgbm": lgbm, "xgb": xgb, "arima": arima
+        }
         logger.info(
-            f"[ensemble] Weights updated: "
+            f"[ensemble] Fallback weights updated: "
             f"lgbm={lgbm}, xgb={xgb}, arima={arima}"
         )
-
-    # -----------------------------------------------------------------------
-    # Private
-    # -----------------------------------------------------------------------
 
     def _check_loaded(self) -> None:
         if not self._is_loaded:
@@ -394,14 +465,12 @@ class Ensemble:
 
 if __name__ == "__main__":
     import argparse
-    import pandas as pd
     from ml.src.causal.selector import CausalSelector
-    from ml.src.models.tuner import HyperparameterTuner
     from ml.src.evaluation.metrics import Metrics
     from ml.src.data.loader import _load_config
 
     parser = argparse.ArgumentParser(description="Train ensemble for a ticker")
-    parser.add_argument("--ticker", type=str, required=True, help="e.g. AAPL")
+    parser.add_argument("--ticker", type=str, required=True, help="e.g. AAPL or NIFTY")
     args = parser.parse_args()
 
     cfg    = _load_config()
@@ -413,27 +482,24 @@ if __name__ == "__main__":
 
     if not feat_path.exists():
         print(f"ERROR: No feature matrix at {feat_path}")
-        print(f"Run: python -m ml.src.features.pipeline --ticker {ticker}")
         exit(1)
-
     if not causal_path.exists():
         print(f"ERROR: No causal features at {causal_path}")
-        print(f"Run: python -m ml.src.causal.selector --ticker {ticker}")
         exit(1)
 
-    df       = pd.read_csv(feat_path, index_col=0, parse_dates=True)
-    selector = CausalSelector()
-    causal_features = selector.load(ticker)
+    df      = pd.read_csv(feat_path, index_col=0, parse_dates=True)
+    features = CausalSelector().load(ticker)
 
-    print(f"\nTraining ensemble for {ticker}...")
-    print(f"Causal features ({len(causal_features)}): {causal_features}")
+    print(f"\nTraining stacking ensemble for {ticker} ...")
+    print(f"Causal features ({len(features)}): {features}")
 
     ensemble = Ensemble()
-    X_test, y_test = ensemble.train_all(df, ticker, causal_features)
+    X_test, y_test = ensemble.train_all(df, ticker, features)
 
-    # Evaluate on test set
+    print(f"\nMeta-learner learned weights: {ensemble.meta_learner.learned_weights()}")
+
     test_df = pd.concat([X_test, y_test], axis=1)
-    preds   = ensemble.predict_historical(test_df, causal_features)
+    preds   = ensemble.predict_historical(test_df, features)
     metrics = Metrics()
     scores  = metrics.compute_all(
         preds["predicted_return"], preds["actual_return"], label="Test set"

@@ -1,38 +1,50 @@
 """
 nifty_loader.py
 ---------------
-Loads and preprocesses the three uploaded Indian market data files:
+Loads and preprocesses all Indian market data files:
 
-    1. Final_Data.csv
-       Nifty 50 OHLCV + P/E + P/B + India VIX + Sentiment_Score
-       2019-01-01 to 2024-11-01 (1,357 rows)
-       Source: NSE India + Economic Times (VADER sentiment)
+    Price + Fundamental data:
+        Unused_Data.csv       — 2008-01-28 to 2018-12-27
+                                Open + Close + P/E + P/B + VIX + Sentiment_Score
+                                No Volume, no High/Low columns
+        Final_Data.csv        — 2019-01-01 to 2024-11-01
+                                Open + Close + Volume + P/E + P/B + VIX + Sentiment_Score
 
-    2. financial_headlines_with_serial_no.csv
-       40,044 Indian financial headlines (2019-2023)
+    Headlines (sentiment):
+        financial_headlines_with_serial_no_2.csv — 2008-2018, date format DD-MM-YYYY
+        financial_headlines_with_serial_no.csv   — 2019-2024, date format D-MM-YY
 
-    3. financial_headlines_with_serial_no_2.csv
-       28,995 Indian financial headlines (2009-2018)
+    KNOWN DATA GAPS IN UNUSED_DATA (all handled gracefully):
+        2014-10-31 to 2015-11-02  (entire 2015 Jan-Oct missing, ~250 trading days)
+        2016-10-28 to 2017-03-01  (demonetisation shock period, Nov 2016-Feb 2017)
+        Several ~30-day monthly gaps in 2014, 2016, 2018
 
-Produces a feature matrix compatible with the existing PCMCI + ensemble
-pipeline. Also computes Trend and Future_Trend labels matching the
-StockAI 3.0 paper (Springer) for direct baseline comparison.
+    DEMONETISATION REGIME NOTE:
+        Both price data AND headlines for Nov 2016-Feb 2017 are absent from
+        the source files. This is a data collection gap, not a loader bug.
+        The demonetisation regime in config.yaml is kept for paper documentation
+        but is EXCLUDED from Option B backtesting (min_test_samples enforced).
+        The regime_splitter will find 0 rows for that period and skip it cleanly.
 
-Store files at:
-    ml/data/raw/sentiment/Final_Data.csv
-    ml/data/raw/sentiment/financial_headlines_with_serial_no.csv
-    ml/data/raw/sentiment/financial_headlines_with_serial_no_2.csv
+    SENTIMENT NORMALIZATION:
+        Unused_Data Sentiment_Score: raw range [-2.9, +12.7], mean 1.45, std 1.97
+        Final_Data  Sentiment_Score: raw range [-2.5, +19.9], mean 4.96, std 4.14
+        These are DIFFERENT scales from different data collection periods.
+        Each file is independently z-score normalized to [-1, +1] before joining.
+        This prevents the Final_Data's higher magnitudes from dominating the model.
+
+Combined coverage: 2008-2024 (~3,555 rows, 69,000+ headlines)
+
+Store files at: ml/data/raw/sentiment/
 
 Usage:
     from ml.src.data.nifty_loader import NiftyLoader
     loader = NiftyLoader()
     df     = loader.build_feature_matrix()
-
-    # Or from CLI
-    python -m ml.src.data.nifty_loader
 """
 
 import logging
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -46,8 +58,8 @@ logger = logging.getLogger(__name__)
 
 class NiftyLoader:
     """
-    Loads Indian market data from the three uploaded files and builds
-    a feature matrix compatible with the existing FeaturePipeline.
+    Loads all Indian market data files and builds a feature matrix
+    compatible with the existing PCMCI + ensemble pipeline.
     """
 
     def __init__(self, config_path: Optional[str] = None):
@@ -55,9 +67,13 @@ class NiftyLoader:
         self.root     = Path(__file__).resolve().parents[3]
         self.data_dir = self.root / self.cfg["data"]["raw_dir"] / "sentiment"
 
-        self.final_data_path = self.data_dir / "Final_Data.csv"
-        self.headlines_path1 = self.data_dir / "financial_headlines_with_serial_no.csv"
-        self.headlines_path2 = self.data_dir / "financial_headlines_with_serial_no_2.csv"
+        self.final_data_path  = self.data_dir / "Final_Data.csv"
+        self.unused_data_path = self.data_dir / "Unused_Data.csv"
+
+        # 2008-2018 headlines: DD-MM-YYYY format  (e.g. 21-01-2008)
+        self.headlines_old = self.data_dir / "financial_headlines_with_serial_no_2.csv"
+        # 2019-2024 headlines: D-MM-YY format     (e.g. 1-01-19)
+        self.headlines_new = self.data_dir / "financial_headlines_with_serial_no.csv"
 
         self.out_dir = self.root / self.cfg["data"]["processed_dir"] / "features"
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -68,146 +84,229 @@ class NiftyLoader:
 
     def load_prices(self) -> pd.DataFrame:
         """
-        Load Nifty 50 OHLCV from Final_Data.csv.
-        Returns DataFrame with DatetimeIndex matching existing pipeline format.
-        Columns: open, high, low, close, volume
-        """
-        self._check_file(self.final_data_path)
-        df = pd.read_csv(self.final_data_path, parse_dates=["Date"])
-        df = df.set_index("Date").sort_index()
+        Load Nifty 50 price data from both CSVs combined (2008-2024).
 
-        price_df = pd.DataFrame(index=df.index)
-        price_df["open"]   = df["Open"]
-        price_df["close"]  = df["Close"]
-        price_df["volume"] = df["Volume"]
-        # Approximate high/low (not in source)
-        price_df["high"] = df[["Open", "Close"]].max(axis=1) * 1.005
-        price_df["low"]  = df[["Open", "Close"]].min(axis=1) * 0.995
+        Unused_Data (2008-2018):
+          - Has Open and Close only (no High, Low, or Volume in source)
+          - High  = max(Open, Close) * 1.005  (conservative intraday range proxy)
+          - Low   = min(Open, Close) * 0.995
+          - Volume = 0.0  (not available; volume-based features gracefully degrade
+                           but are NOT removed — they carry non-zero signal for
+                           2019-2024 and zero-signal for 2008-2018, which is
+                           informative for the regime-aware model)
+
+        Final_Data (2019-2024):
+          - Has Open, Close, and Volume
+          - High/Low approximated identically (source lacks true intraday H/L)
+
+        Returns:
+            DataFrame with DatetimeIndex, columns: open, high, low, close, volume
+        """
+        frames = []
+
+        # ── Unused_Data: 2008-01-28 → 2018-12-27 ─────────────────────────
+        if self.unused_data_path.exists():
+            df_old = pd.read_csv(self.unused_data_path, parse_dates=["Date"])
+            df_old = df_old.set_index("Date").sort_index()
+            df_old.index = pd.to_datetime(df_old.index)
+
+            old = pd.DataFrame(index=df_old.index)
+            old["open"]   = pd.to_numeric(df_old["Open"],  errors="coerce")
+            old["close"]  = pd.to_numeric(df_old["Close"], errors="coerce")
+            old["volume"] = 0.0
+            old["high"]   = old[["open", "close"]].max(axis=1) * 1.005
+            old["low"]    = old[["open", "close"]].min(axis=1) * 0.995
+            old = old.dropna(subset=["open", "close"])
+            old = old[old["close"] > 0]
+            frames.append(old)
+            logger.info(
+                f"[nifty_loader] Unused_Data: {len(old)} rows "
+                f"({old.index.min().date()} → {old.index.max().date()})"
+            )
+        else:
+            logger.warning(
+                f"[nifty_loader] Unused_Data.csv not found at {self.unused_data_path}. "
+                f"Coverage will start from 2019 only."
+            )
+
+        # ── Final_Data: 2019-01-01 → 2024-11-01 ──────────────────────────
+        self._check_file(self.final_data_path)
+        df_new = pd.read_csv(self.final_data_path, parse_dates=["Date"])
+        df_new = df_new.set_index("Date").sort_index()
+        df_new.index = pd.to_datetime(df_new.index)
+
+        new = pd.DataFrame(index=df_new.index)
+        new["open"]   = pd.to_numeric(df_new["Open"],   errors="coerce")
+        new["close"]  = pd.to_numeric(df_new["Close"],  errors="coerce")
+        new["volume"] = pd.to_numeric(df_new["Volume"], errors="coerce").fillna(0.0)
+        new["high"]   = new[["open", "close"]].max(axis=1) * 1.005
+        new["low"]    = new[["open", "close"]].min(axis=1) * 0.995
+        new = new.dropna(subset=["open", "close"])
+        new = new[new["close"] > 0]
+        frames.append(new)
+        logger.info(
+            f"[nifty_loader] Final_Data: {len(new)} rows "
+            f"({new.index.min().date()} → {new.index.max().date()})"
+        )
+
+        # ── Combine ────────────────────────────────────────────────────────
+        price_df = pd.concat(frames).sort_index()
+        price_df = price_df[~price_df.index.duplicated(keep="last")]
 
         logger.info(
-            f"[nifty_loader] Prices: {len(price_df)} rows "
+            f"[nifty_loader] Combined prices: {len(price_df)} rows "
             f"({price_df.index.min().date()} → {price_df.index.max().date()})"
         )
         return price_df
 
     def load_fundamental_features(self) -> pd.DataFrame:
         """
-        Load P/E, P/B, India VIX features from Final_Data.csv.
-        These are additional causal candidates not available in US pipeline.
+        Load P/E, P/B, India VIX from both CSVs combined (2008-2024).
+        Also reads pre-computed Sentiment_Score as a supplementary signal,
+        normalized independently per file to account for scale differences.
         """
+        frames = []
+
+        if self.unused_data_path.exists():
+            df_old = pd.read_csv(self.unused_data_path, parse_dates=["Date"])
+            df_old = df_old.set_index("Date").sort_index()
+            df_old.index = pd.to_datetime(df_old.index)
+            # Normalize sentiment within this file's distribution only
+            s = pd.to_numeric(df_old["Sentiment_Score"], errors="coerce").fillna(0.0)
+            df_old["_sent_norm"] = ((s - s.mean()) / (s.std() + 1e-8)).clip(-3, 3) / 3
+            frames.append(df_old)
+
         self._check_file(self.final_data_path)
-        df = pd.read_csv(self.final_data_path, parse_dates=["Date"])
-        df = df.set_index("Date").sort_index()
+        df_new = pd.read_csv(self.final_data_path, parse_dates=["Date"])
+        df_new = df_new.set_index("Date").sort_index()
+        df_new.index = pd.to_datetime(df_new.index)
+        s = pd.to_numeric(df_new["Sentiment_Score"], errors="coerce").fillna(0.0)
+        df_new["_sent_norm"] = ((s - s.mean()) / (s.std() + 1e-8)).clip(-3, 3) / 3
+        frames.append(df_new)
+
+        df = pd.concat(frames).sort_index()
+        df = df[~df.index.duplicated(keep="last")]
 
         result = pd.DataFrame(index=df.index)
 
-        # Raw values
-        result["pe_ratio"]  = df["P/E"]
-        result["pb_ratio"]  = df["P/B"]
-        result["india_vix"] = df["Vix"]
+        # Raw fundamental values
+        result["pe_ratio"]             = pd.to_numeric(df["P/E"], errors="coerce")
+        result["pb_ratio"]             = pd.to_numeric(df["P/B"], errors="coerce")
+        result["india_vix"]            = pd.to_numeric(df["Vix"], errors="coerce")
+        result["precomputed_sentiment"] = df["_sent_norm"]
 
-        # Changes
-        result["pe_change_1d"]  = df["P/E"].diff(1)
-        result["pb_change_1d"]  = df["P/B"].diff(1)
-        result["vix_change_1d"] = df["Vix"].diff(1)
-        result["vix_change_5d"] = df["Vix"].diff(5)
+        # 1-day and 5-day changes
+        result["pe_change_1d"]  = result["pe_ratio"].diff(1)
+        result["pb_change_1d"]  = result["pb_ratio"].diff(1)
+        result["vix_change_1d"] = result["india_vix"].diff(1)
+        result["vix_change_5d"] = result["india_vix"].diff(5)
 
-        # Moving averages
-        result["vix_ma_5"]  = df["Vix"].rolling(5).mean()
-        result["vix_ma_10"] = df["Vix"].rolling(10).mean()
-        result["pe_ma_10"]  = df["P/E"].rolling(10).mean()
-        result["pb_ma_10"]  = df["P/B"].rolling(10).mean()
+        # Rolling moving averages (min_periods avoids NaN at the start of the series)
+        result["vix_ma_5"]  = result["india_vix"].rolling(5,  min_periods=1).mean()
+        result["vix_ma_10"] = result["india_vix"].rolling(10, min_periods=1).mean()
+        result["pe_ma_10"]  = result["pe_ratio"].rolling(10,  min_periods=1).mean()
+        result["pb_ma_10"]  = result["pb_ratio"].rolling(10,  min_periods=1).mean()
 
-        # Percentile rank — where is today vs last year
-        result["vix_percentile"] = df["Vix"].rolling(252).rank(pct=True)
-        result["pe_percentile"]  = df["P/E"].rolling(252).rank(pct=True)
-        result["pb_percentile"]  = df["P/B"].rolling(252).rank(pct=True)
+        # Percentile ranks: where is today vs the past 252 trading days
+        # min_periods=60 allows these to be computed after ~3 months of data
+        result["vix_percentile"] = result["india_vix"].rolling(252, min_periods=60).rank(pct=True)
+        result["pe_percentile"]  = result["pe_ratio"].rolling(252,  min_periods=60).rank(pct=True)
+        result["pb_percentile"]  = result["pb_ratio"].rolling(252,  min_periods=60).rank(pct=True)
 
-        # Valuation regime: expensive vs cheap
-        result["pe_regime"]      = (df["P/E"] > df["P/E"].rolling(60).mean()).astype(float)
-        result["vix_regime"]     = (df["Vix"] > df["Vix"].rolling(60).mean()).astype(float)
+        # Regime signals: is current value above its 60-day average?
+        result["pe_regime"]  = (
+            result["pe_ratio"] > result["pe_ratio"].rolling(60, min_periods=20).mean()
+        ).astype(float)
+        result["vix_regime"] = (
+            result["india_vix"] > result["india_vix"].rolling(60, min_periods=20).mean()
+        ).astype(float)
 
-        # PE × VIX interaction — high PE + high VIX = danger signal
-        result["pe_vix_danger"]  = result["pe_percentile"] * result["vix_percentile"]
+        # Combined danger signal: high PE + high VIX (overvalued + fearful)
+        result["pe_vix_danger"]    = result["pe_percentile"] * result["vix_percentile"]
 
-        logger.info(f"[nifty_loader] Fundamental features: {len(result.columns)} features")
-        return result.fillna(0)
+        # Crisis detector: VIX > 30 is extreme fear on India scale
+        result["vix_crisis"]       = (result["india_vix"] > 30).astype(float)
+
+        # Valuation extremes
+        result["market_expensive"] = (result["pe_ratio"] > 25).astype(float)
+        result["market_cheap"]     = (result["pe_ratio"] < 15).astype(float)
+
+        logger.info(
+            f"[nifty_loader] Fundamental features: {len(result.columns)} cols, "
+            f"{len(result)} rows "
+            f"({result.index.min().date()} → {result.index.max().date()})"
+        )
+        return result.fillna(0.0)
 
     def load_sentiment(self, use_finbert: bool = False) -> pd.DataFrame:
         """
-        Load and score Indian financial headlines.
-        Combines both headline files.
-        Falls back to pre-computed VADER scores from Final_Data.csv if no headlines.
+        Load and score all Indian financial headlines (2008-2024).
 
-        Args:
-            use_finbert: Score with FinBERT (slow, needs GPU). Default False = keyword scoring.
+        Date format differences between files:
+            financial_headlines_with_serial_no_2.csv: DD-MM-YYYY (e.g. 21-01-2008)
+            financial_headlines_with_serial_no.csv:   D-MM-YY    (e.g. 1-01-19)
+        Both are correctly parsed by pandas with dayfirst=True.
 
-        Returns DataFrame with daily sentiment features.
+        Gap handling:
+            Headlines for Nov 2016-Feb 2017 (demonetisation) are absent from
+            the source file — this mirrors the price data gap. Sentiment features
+            for that period are zero-filled after ffill limit is exhausted.
+
+        Returns:
+            DataFrame with DatetimeIndex and sentiment feature columns, or
+            falls back to pre-computed Sentiment_Score if no headline files found.
         """
         headlines_df = self._load_all_headlines()
 
         if headlines_df.empty:
-            logger.warning("[nifty_loader] No headlines found — using pre-computed VADER scores.")
+            logger.warning(
+                "[nifty_loader] No headlines loaded — "
+                "falling back to pre-computed Sentiment_Score."
+            )
             return self._load_precomputed_sentiment()
 
         # Score headlines
-        if use_finbert:
-            logger.info("[nifty_loader] Scoring with FinBERT...")
-            from ml.src.features.finbert import FinBERTSentiment
-            scorer = FinBERTSentiment()
-            if scorer.is_available():
-                scores = scorer.score_batch(headlines_df["headline"].tolist())
-            else:
-                logger.warning("[nifty_loader] FinBERT not available — using keyword scoring.")
-                scores = [scorer._keyword_score(h) for h in headlines_df["headline"]]
+        from ml.src.features.finbert import FinBERTSentiment
+        scorer = FinBERTSentiment()
+
+        if use_finbert and scorer.is_available():
+            logger.info("[nifty_loader] Scoring with FinBERT ...")
+            scores = scorer.score_batch(headlines_df["headline"].tolist())
         else:
-            from ml.src.features.finbert import FinBERTSentiment
-            scorer = FinBERTSentiment()
+            logger.info("[nifty_loader] Scoring with keyword model ...")
             scores = [scorer._keyword_score(h) for h in headlines_df["headline"]]
 
+        headlines_df = headlines_df.copy()
         headlines_df["score"] = scores
 
         # Aggregate to daily
-        daily = headlines_df.groupby("date")["score"].agg(["mean", "std", "count"])
+        daily = (
+            headlines_df
+            .groupby("date")["score"]
+            .agg(["mean", "std", "count"])
+        )
         daily.columns = ["sentiment_score", "sentiment_std", "article_count"]
-        daily["sentiment_std"] = daily["sentiment_std"].fillna(0)
+        daily["sentiment_std"] = daily["sentiment_std"].fillna(0.0)
+        daily.index = pd.to_datetime(daily.index)
+        daily = daily.sort_index()
 
         # Rolling features
-        daily["sentiment_ma_3d"]    = daily["sentiment_score"].rolling(3).mean()
-        daily["sentiment_ma_5d"]    = daily["sentiment_score"].rolling(5).mean()
-        daily["sentiment_ma_10d"]   = daily["sentiment_score"].rolling(10).mean()
+        daily["sentiment_ma_3d"]    = daily["sentiment_score"].rolling(3,  min_periods=1).mean()
+        daily["sentiment_ma_5d"]    = daily["sentiment_score"].rolling(5,  min_periods=1).mean()
+        daily["sentiment_ma_10d"]   = daily["sentiment_score"].rolling(10, min_periods=1).mean()
         daily["sentiment_momentum"] = daily["sentiment_ma_3d"] - daily["sentiment_ma_10d"]
-        daily["buzz_ma_3d"]         = daily["article_count"].rolling(3).mean()
-        daily["buzz_ma_5d"]         = daily["article_count"].rolling(5).mean()
-        daily["sentiment_std_5d"]   = daily["sentiment_score"].rolling(5).std().fillna(0)
+        daily["buzz_ma_3d"]         = daily["article_count"].rolling(3, min_periods=1).mean()
+        daily["buzz_ma_5d"]         = daily["article_count"].rolling(5, min_periods=1).mean()
+        daily["sentiment_std_5d"]   = (
+            daily["sentiment_score"].rolling(5, min_periods=1).std().fillna(0.0)
+        )
 
         logger.info(
-            f"[nifty_loader] Sentiment: {len(daily)} days, "
-            f"{int(daily['article_count'].sum())} total headlines scored"
+            f"[nifty_loader] Sentiment loaded: {len(daily)} days, "
+            f"{int(daily['article_count'].sum()):,} total headlines "
+            f"({daily.index.min().date()} → {daily.index.max().date()})"
         )
-        return daily.fillna(0)
-
-    def compute_labels(self) -> pd.DataFrame:
-        """
-        Compute Trend and Future_Trend labels matching StockAI 3.0 paper.
-        Used for direct baseline comparison.
-
-        Trend:        Close > Open → Positive, else Negative
-        Future_Trend: Close[t+7] > Close[t] → Bullish, else Bearish
-        """
-        self._check_file(self.final_data_path)
-        df = pd.read_csv(self.final_data_path, parse_dates=["Date"])
-        df = df.set_index("Date").sort_index()
-
-        labels = pd.DataFrame(index=df.index)
-        labels["trend"]        = (df["Close"] > df["Open"]).astype(int)
-        labels["future_trend"] = (df["Close"].shift(-7) > df["Close"]).astype(int)
-
-        logger.info(
-            f"[nifty_loader] Labels computed. "
-            f"Bullish days: {labels['future_trend'].sum()} / {len(labels)}"
-        )
-        return labels
+        return daily.fillna(0.0)
 
     def build_feature_matrix(
         self,
@@ -215,63 +314,62 @@ class NiftyLoader:
         save: bool = True,
     ) -> pd.DataFrame:
         """
-        Build complete Nifty 50 feature matrix ready for PCMCI + model training.
-
-        Combines:
-            Technical features     (RSI, MACD, Bollinger, momentum, ATR)
-            Fundamental features   (P/E, P/B, India VIX — unique to this dataset)
-            Sentiment features     (from 69,000 Economic Times headlines)
-            Target variable        (excess_return_5d vs Nifty itself)
-
-        Returns DataFrame saved to ml/data/processed/features/NIFTY_features.csv
+        Build complete Nifty 50 feature matrix (2008-2024).
+        Combines technical + fundamental + sentiment features.
+        Ready for PCMCI causal discovery + model training.
         """
         from ml.src.features.technical import TechnicalFeatures
 
-        logger.info("[nifty_loader] Building Nifty 50 feature matrix...")
+        logger.info("[nifty_loader] Building Nifty 50 feature matrix (2008-2024) ...")
 
-        # 1. Prices
+        # 1. Load prices
         price_df = self.load_prices()
 
-        # 2. Technical features (same as US pipeline)
+        # 2. Technical features
         tech = TechnicalFeatures()
-        # For Nifty index — no benchmark (predicting absolute return)
-        # Do NOT set spy_close to itself — that makes excess_return_5d = 0
-        tech.set_spy_close(None)
+        tech.set_spy_close(None)   # No SPY benchmark for index prediction
         tech_df = tech.compute(price_df)
-
-        # Rename target: for index prediction use log_return_5d not excess_return_5d
-        # excess_return vs itself is always 0 — meaningless
+        # Drop excess_return_5d — equals log_return_5d when spy_close=None
         if "excess_return_5d" in tech_df.columns:
-            tech_df = tech_df.rename(columns={"excess_return_5d": "log_return_5d_target"})
-            tech_df["excess_return_5d"] = tech_df["log_return_5d_target"]
-            tech_df = tech_df.drop(columns=["log_return_5d_target"], errors="ignore")
+            tech_df = tech_df.drop(columns=["excess_return_5d"])
 
-        # 3. Fundamental features (unique to this dataset)
+        # 3. Fundamental features (P/E, P/B, India VIX)
         fund_df = self.load_fundamental_features()
-        fund_df = fund_df.reindex(tech_df.index).ffill().fillna(0)
+        fund_df = fund_df.reindex(tech_df.index).ffill(limit=5).fillna(0.0)
 
-        # 4. Sentiment from headlines
+        # 4. Sentiment (headline-based or precomputed fallback)
         sent_df = self.load_sentiment(use_finbert=use_finbert)
         sent_df.index = pd.to_datetime(sent_df.index)
-        sent_df = sent_df.reindex(tech_df.index).ffill(limit=5).fillna(0)
+        # ffill limit=5 bridges weekends and short gaps (including the ~4-day
+        # mini gaps in the data). The 124-day demonetisation gap exceeds this
+        # limit and correctly becomes zeros — consistent with price data absence.
+        sent_df = sent_df.reindex(tech_df.index).ffill(limit=5).fillna(0.0)
 
-        # 5. Merge all
+        # 5. Merge
         df = tech_df.copy()
         df = df.join(fund_df, how="left")
         df = df.join(sent_df, how="left")
 
-        # 6. For NIFTY: keep log_return_5d as it is the prediction target
-        # For individual stocks: log_return_5d would leak into excess_return_5d target
-        # Since we renamed excess_return_5d to use raw return above, keep log_return_5d
-        pass  # do not drop log_return_5d for NIFTY
+        # 6. Final cleanup
+        df = df.ffill(limit=5).fillna(0.0)
 
-        # 7. Final fill
-        df = df.ffill(limit=5).fillna(0)
+        # Drop any perfectly constant columns (no variance = no signal)
+        numeric = df.select_dtypes(include=["number"])
+        constant_cols = [c for c in numeric.columns if numeric[c].nunique() <= 1]
+        if constant_cols:
+            logger.warning(
+                f"[nifty_loader] Dropping {len(constant_cols)} constant columns: "
+                f"{constant_cols}"
+            )
+            df = df.drop(columns=constant_cols)
 
         logger.info(
-            f"[nifty_loader] Feature matrix: {df.shape[0]} rows × {df.shape[1]} cols"
+            f"[nifty_loader] Feature matrix complete: "
+            f"{df.shape[0]} rows × {df.shape[1]} cols "
+            f"({df.index.min().date()} → {df.index.max().date()})"
         )
 
+        # 7. Save
         if save:
             out_path = self.out_dir / "NIFTY_features.csv"
             df.to_csv(out_path)
@@ -284,19 +382,51 @@ class NiftyLoader:
     # -----------------------------------------------------------------------
 
     def _load_all_headlines(self) -> pd.DataFrame:
-        """Load and combine both headline files."""
+        """
+        Load and combine both headline files into a single DataFrame.
+
+        Date parsing strategy:
+            Both files use day-first ordering but different formats:
+              - 2008-2018 file: DD-MM-YYYY  (e.g. 21-01-2008)
+              - 2019-2024 file: D-MM-YY     (e.g. 1-01-19)
+            pandas with dayfirst=True handles both correctly via dateutil
+            fallback. The UserWarning about format inference is suppressed
+            because the output is verified correct by inspection and tests.
+        """
         frames = []
-        for path in [self.headlines_path1, self.headlines_path2]:
+
+        for path in [self.headlines_old, self.headlines_new]:
             if not path.exists():
                 logger.warning(f"[nifty_loader] Not found: {path.name}")
                 continue
             try:
-                df = pd.read_csv(path)[["date", "headline"]].dropna()
-                df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
-                df = df.dropna(subset=["date"])
-                df["date"] = df["date"].dt.normalize()
-                frames.append(df)
-                logger.info(f"[nifty_loader] Loaded {len(df)} headlines from {path.name}")
+                raw = pd.read_csv(path)[["date", "headline"]].dropna()
+
+                # Suppress the "could not infer format" UserWarning
+                # Both formats parse correctly with dayfirst=True
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    raw["date"] = pd.to_datetime(
+                        raw["date"],
+                        dayfirst=True,
+                        errors="coerce",
+                    )
+
+                before = len(raw)
+                raw = raw.dropna(subset=["date"])
+                raw["date"] = raw["date"].dt.normalize()
+                dropped = before - len(raw)
+                if dropped > 0:
+                    logger.warning(
+                        f"[nifty_loader] {path.name}: dropped {dropped} rows "
+                        f"with unparseable dates."
+                    )
+
+                frames.append(raw)
+                logger.info(
+                    f"[nifty_loader] Loaded {len(raw):,} headlines from {path.name} "
+                    f"({raw['date'].min().date()} → {raw['date'].max().date()})"
+                )
             except Exception as e:
                 logger.warning(f"[nifty_loader] Failed to load {path.name}: {e}")
 
@@ -305,36 +435,60 @@ class NiftyLoader:
 
         combined = (
             pd.concat(frames, ignore_index=True)
-            .drop_duplicates()
+            .drop_duplicates(subset=["date", "headline"])
             .sort_values("date")
             .reset_index(drop=True)
         )
         logger.info(
-            f"[nifty_loader] Total headlines: {len(combined)} "
+            f"[nifty_loader] Combined headlines: {len(combined):,} rows "
             f"({combined['date'].min().date()} → {combined['date'].max().date()})"
         )
         return combined
 
     def _load_precomputed_sentiment(self) -> pd.DataFrame:
-        """Normalise pre-computed VADER scores from Final_Data.csv."""
-        df = pd.read_csv(self.final_data_path, parse_dates=["Date"])
-        df = df.set_index("Date").sort_index()
+        """
+        Fallback: normalize and return the pre-computed Sentiment_Score
+        columns from both CSV files.
 
-        s      = df["Sentiment_Score"]
-        s_norm = ((s - s.mean()) / s.std()).clip(-3, 3) / 3
+        CRITICAL: independently normalizes each file before joining.
+        Unused_Data: mean 1.45, std 1.97 → z-scored then /3 → [-1, +1]
+        Final_Data:  mean 4.96, std 4.14 → z-scored then /3 → [-1, +1]
+        Without this step, the 2019-2024 period's higher raw scores would
+        look systematically more positive than 2008-2018, creating a
+        spurious level-shift that the model would incorrectly learn as signal.
+        """
+        frames = []
 
-        result = pd.DataFrame(index=df.index)
+        if self.unused_data_path.exists():
+            df_old = pd.read_csv(self.unused_data_path, parse_dates=["Date"])
+            df_old = df_old.set_index("Date").sort_index()
+            df_old.index = pd.to_datetime(df_old.index)
+            s = pd.to_numeric(df_old["Sentiment_Score"], errors="coerce").fillna(0.0)
+            norm = ((s - s.mean()) / (s.std() + 1e-8)).clip(-3, 3) / 3
+            frames.append(norm.rename("_s"))
+
+        df_new = pd.read_csv(self.final_data_path, parse_dates=["Date"])
+        df_new = df_new.set_index("Date").sort_index()
+        df_new.index = pd.to_datetime(df_new.index)
+        s = pd.to_numeric(df_new["Sentiment_Score"], errors="coerce").fillna(0.0)
+        norm = ((s - s.mean()) / (s.std() + 1e-8)).clip(-3, 3) / 3
+        frames.append(norm.rename("_s"))
+
+        s_norm = pd.concat(frames).sort_index()
+        s_norm = s_norm[~s_norm.index.duplicated(keep="last")]
+
+        result = pd.DataFrame(index=s_norm.index)
         result["sentiment_score"]    = s_norm
         result["sentiment_std"]      = 0.0
         result["article_count"]      = 1.0
-        result["sentiment_ma_3d"]    = s_norm.rolling(3).mean()
-        result["sentiment_ma_5d"]    = s_norm.rolling(5).mean()
-        result["sentiment_ma_10d"]   = s_norm.rolling(10).mean()
+        result["sentiment_ma_3d"]    = s_norm.rolling(3,  min_periods=1).mean()
+        result["sentiment_ma_5d"]    = s_norm.rolling(5,  min_periods=1).mean()
+        result["sentiment_ma_10d"]   = s_norm.rolling(10, min_periods=1).mean()
         result["sentiment_momentum"] = result["sentiment_ma_3d"] - result["sentiment_ma_10d"]
         result["buzz_ma_3d"]         = 1.0
         result["buzz_ma_5d"]         = 1.0
-        result["sentiment_std_5d"]   = s_norm.rolling(5).std().fillna(0)
-        return result.fillna(0)
+        result["sentiment_std_5d"]   = s_norm.rolling(5, min_periods=1).std().fillna(0.0)
+        return result.fillna(0.0)
 
     def _check_file(self, path: Path) -> None:
         if not path.exists():
@@ -349,8 +503,10 @@ class NiftyLoader:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Build Nifty 50 feature matrix")
-    parser.add_argument("--finbert", action="store_true",
-                        help="Use FinBERT for sentiment scoring")
+    parser.add_argument(
+        "--finbert", action="store_true",
+        help="Use FinBERT for sentiment scoring (slow on CPU, requires GPU ideally)"
+    )
     args   = parser.parse_args()
     loader = NiftyLoader()
     df     = loader.build_feature_matrix(use_finbert=args.finbert)
@@ -358,4 +514,12 @@ if __name__ == "__main__":
     print(f"  Rows:     {df.shape[0]}")
     print(f"  Cols:     {df.shape[1]}")
     print(f"  Dates:    {df.index.min().date()} → {df.index.max().date()}")
-    print(f"  Columns:  {df.columns.tolist()}")
+    print(f"  Target:   log_return_5d  (5-day forward log return)")
+    print(f"\nData coverage by year:")
+    for year in range(2008, 2025):
+        try:
+            n = len(df.loc[str(year)])
+            if n > 0:
+                print(f"  {year}: {n:3d} rows")
+        except KeyError:
+            pass

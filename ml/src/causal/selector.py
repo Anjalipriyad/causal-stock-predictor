@@ -61,8 +61,9 @@ class CausalSelector:
     Combines Granger + PCMCI results and saves the final causal feature list.
     """
 
-    def __init__(self, config_path: Optional[str] = None):
-        cfg      = _load_config(config_path)
+    def __init__(self, config_path: Optional[str] = None, cfg: Optional[dict] = None):
+        # Allow passing an already-loaded config dict to keep runtime overrides
+        cfg = cfg if cfg is not None else _load_config(config_path)
         selector = cfg["causal"]["selector"]
 
         self.strategy           = selector["strategy"]

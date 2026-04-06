@@ -100,8 +100,9 @@ class BaseModel(ABC):
     is handled here so subclasses stay clean.
     """
 
-    def __init__(self, config_path: Optional[str] = None):
-        self.cfg        = _load_config(config_path)
+    def __init__(self, config_path: Optional[str] = None, cfg: Optional[dict] = None):
+        # Allow callers to pass an already-loaded config dict (overrides file)
+        self.cfg = cfg if cfg is not None else _load_config(config_path)
         self.root       = Path(__file__).resolve().parents[3]
         self.target_col = self.cfg["model"]["target"]
         self.horizon    = self.cfg["model"]["horizon_days"]

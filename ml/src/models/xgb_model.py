@@ -33,8 +33,8 @@ class XGBModel(BaseModel):
     Comparison model — second highest weight in the ensemble.
     """
 
-    def __init__(self, config_path: Optional[str] = None):
-        super().__init__(config_path)
+    def __init__(self, config_path: Optional[str] = None, cfg: Optional[dict] = None):
+        super().__init__(config_path, cfg)
         self.model_name = "xgb"
         self._model: Optional[xgb.Booster] = None
         self._feature_names: list[str] = []

@@ -40,8 +40,8 @@ class ARIMAModel(BaseModel):
     Predicts 5-day forward log return from the return time series alone.
     """
 
-    def __init__(self, config_path: Optional[str] = None):
-        super().__init__(config_path)
+    def __init__(self, config_path: Optional[str] = None, cfg: Optional[dict] = None):
+        super().__init__(config_path, cfg)
         self.model_name = "arima"
         self._model     = None
         self._y_train: Optional[pd.Series] = None

@@ -41,8 +41,8 @@ class TFTModel(BaseModel):
     Falls back to LightGBM if pytorch-forecasting is not installed.
     """
 
-    def __init__(self, config_path: Optional[str] = None):
-        super().__init__(config_path)
+    def __init__(self, config_path: Optional[str] = None, cfg: Optional[dict] = None):
+        super().__init__(config_path, cfg)
         self.model_name  = "tft"
         self._model      = None
         self._trainer    = None
