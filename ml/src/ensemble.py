@@ -50,6 +50,7 @@ from ml.src.models.lgbm_model import LGBMModel
 from ml.src.models.xgb_model import XGBModel
 from ml.src.models.arima_model import ARIMAModel
 from ml.src.models.stacking_meta_learner import StackingMetaLearner
+from ml.src.models.meta_classifier import MetaClassifier
 from ml.src.causal.selector import CausalSelector
 from ml.src.models.tuner import HyperparameterTuner
 
@@ -121,6 +122,8 @@ class Ensemble:
         self._ticker:           Optional[str]       = None
         self._causal_features:  Optional[list[str]] = None
         self._is_loaded:        bool                = False
+        self.meta_classifier:    Optional[MetaClassifier] = None
+        self._thresholds:        dict = {}
 
     # -----------------------------------------------------------------------
     # Load / train
@@ -154,6 +157,24 @@ class Ensemble:
 
         # Load meta-learner (falls back to fixed weights if not found)
         self.meta_learner.load(ticker, self.models_dir)
+
+        # Attempt to load an optional meta-classifier (classification fallback)
+        try:
+            self.meta_classifier = MetaClassifier.load(ticker, models_dir=self.models_dir)
+            logger.info(f"[ensemble] Meta-classifier loaded for {ticker}.")
+        except Exception:
+            self.meta_classifier = None
+
+        # Load tuned thresholds if present
+        try:
+            import json
+            path = self.models_dir / f"thresholds_{ticker}.json"
+            if path.exists():
+                with open(path) as f:
+                    self._thresholds = json.load(f)
+                    logger.info(f"[ensemble] Loaded thresholds for {ticker}: {self._thresholds}")
+        except Exception:
+            self._thresholds = {}
 
         self._causal_features = self.selector.load(ticker)
         self._ticker          = ticker
@@ -199,6 +220,26 @@ class Ensemble:
         X_train, X_val, X_test, y_train, y_val, y_test = \
             self.lgbm.prepare_data(df, causal_features)
 
+        # ── 1b. Optional sample weighting to upweight crash / extreme-VIX rows
+        # (prevents the model from treating crashes as pure noise)
+        sample_weights = None
+        try:
+            sw_cfg = self.cfg["model"].get("sample_weighting", {"enabled": False})
+            if sw_cfg.get("enabled", False) and ("india_vix" in X_train.columns or "vix_level" in X_train.columns):
+                vix_col = "india_vix" if "india_vix" in X_train.columns else "vix_level"
+                vix_vals = X_train[vix_col].values
+                base = float(sw_cfg.get("base_weight", 1.0))
+                sample_weights = np.ones(len(vix_vals), dtype=float) * base
+                # Apply configurable thresholds/weights
+                extreme_thr = float(sw_cfg.get("extreme_vix_threshold", 50))
+                extreme_w = float(sw_cfg.get("extreme_vix_weight", 5.0))
+                moderate_thr = float(sw_cfg.get("moderate_vix_threshold", 35))
+                moderate_w = float(sw_cfg.get("moderate_vix_weight", 3.0))
+                sample_weights = np.where(vix_vals > extreme_thr, extreme_w, sample_weights)
+                sample_weights = np.where(vix_vals > moderate_thr, moderate_w, sample_weights)
+        except Exception:
+            sample_weights = None
+
         # ── 2. Scale ───────────────────────────────────────────────────────
         X_train_s, X_val_s, X_test_s = self.lgbm.scale(X_train, X_val, X_test, ticker)
         # XGBoost uses the same scaler (fitted by LGBM above)
@@ -214,10 +255,15 @@ class Ensemble:
             self.xgb._params.update(best_xgb)
 
         # ── 4. Train base models ───────────────────────────────────────────
-        self.lgbm.fit(X_train_s, y_train, X_val_s, y_val)
+        # Pass sample weights into LightGBM training if computed
+        self.lgbm.fit(X_train_s, y_train, X_val_s, y_val, sample_weight=sample_weights)
         self.lgbm.save(ticker)
 
-        self.xgb.fit(X_train_s, y_train, X_val_s, y_val)
+        try:
+            self.xgb.fit(X_train_s, y_train, X_val_s, y_val, sample_weight=sample_weights)
+        except TypeError:
+            # Some XGBModel versions may not accept sample_weight
+            self.xgb.fit(X_train_s, y_train, X_val_s, y_val)
         self.xgb.save(ticker)
 
         # ARIMA: fit on TRAIN ONLY for the meta-learner step to avoid
@@ -255,6 +301,74 @@ class Ensemble:
             lstm_preds  = lstm_val_preds,
         )
         self.meta_learner.save(ticker, self.models_dir)
+
+        # ------------------------------------------------------------------
+        # Train optional meta-classifier on validation predictions (direction)
+        # ------------------------------------------------------------------
+        try:
+            meta_clf = MetaClassifier(cfg=self.cfg)
+            preds_dict = {"lgbm": val_lgbm, "xgb": val_xgb, "arima": val_arima}
+            if lstm_val_preds is not None:
+                preds_dict["lstm"] = lstm_val_preds
+            meta_clf.fit(preds_dict, y_val.values)
+            meta_clf.save(ticker, models_dir=self.models_dir)
+            self.meta_classifier = meta_clf
+            logger.info("[ensemble] Meta-classifier trained and saved.")
+        except Exception as e:
+            logger.warning(f"[ensemble] Meta-classifier training failed: {e}")
+
+        # ------------------------------------------------------------------
+        # Threshold tuning on validation set — saves tuned thresholds for
+        # later per-ticker/regime inference.
+        # ------------------------------------------------------------------
+        try:
+            import json
+            tun = self.cfg["model"].get("threshold_tuning", {})
+            # regressor threshold grid
+            rmin = float(tun.get("regressor_grid_min", -0.05))
+            rmax = float(tun.get("regressor_grid_max", 0.05))
+            rsteps = int(tun.get("regressor_grid_steps", 101))
+            rgrid = np.linspace(rmin, rmax, rsteps)
+
+            val_blended = self.meta_learner.predict_batch(val_lgbm, val_xgb, val_arima, lstm_val_preds)
+            y_dir = (y_val.values >= 0).astype(int)
+            best_r = 0.0
+            best_r_score = -1.0
+            for t in rgrid:
+                preds_dir = (val_blended >= t).astype(int)
+                score = (preds_dir == y_dir).mean()
+                if score > best_r_score:
+                    best_r_score = score
+                    best_r = float(t)
+
+            # classifier threshold grid (if classifier trained)
+            best_c = 0.5
+            if self.meta_classifier is not None:
+                cmin = float(tun.get("classifier_grid_min", 0.3))
+                cmax = float(tun.get("classifier_grid_max", 0.7))
+                csteps = int(tun.get("classifier_grid_steps", 41))
+                cgrid = np.linspace(cmin, cmax, csteps)
+                probs = self.meta_classifier.predict_proba(preds_dict)
+                best_c_score = -1.0
+                for pth in cgrid:
+                    preds_dir = (probs >= pth).astype(int)
+                    score = (preds_dir == y_dir).mean()
+                    if score > best_c_score:
+                        best_c_score = score
+                        best_c = float(pth)
+
+            thresholds = {
+                "regressor_threshold": best_r,
+                "regressor_da": float(best_r_score),
+                "classifier_threshold": best_c,
+            }
+            path = self.models_dir / f"thresholds_{ticker}.json"
+            with open(path, "w") as f:
+                json.dump(thresholds, f)
+            self._thresholds = thresholds
+            logger.info(f"[ensemble] Thresholds tuned and saved → {path.name}")
+        except Exception as e:
+            logger.warning(f"[ensemble] Threshold tuning failed: {e}")
 
         self._ticker          = ticker
         self._causal_features = causal_features
@@ -316,17 +430,29 @@ class Ensemble:
             except Exception as e:
                 logger.debug(f"[ensemble] LSTM live prediction failed: {e}")
 
-        # Blend via meta-learner (or fallback to fixed weights)
-        pred_blended = self.meta_learner.predict(
-            lgbm_pred  = pred_lgbm,
-            xgb_pred   = pred_xgb,
-            arima_pred = pred_arima,
-            lstm_pred  = pred_lstm,
-        )
+        # Choose classifier-based direction if configured and available
+        use_clf = bool(self.cfg["model"].get("use_meta_classifier", False)) and (self.meta_classifier is not None)
+        if use_clf:
+            preds_row = {"lgbm": np.array([pred_lgbm]), "xgb": np.array([pred_xgb]), "arima": np.array([pred_arima])}
+            if pred_lstm is not None:
+                preds_row["lstm"] = np.array([pred_lstm])
+            prob = float(self.meta_classifier.predict_proba(preds_row)[0])
+            clf_thresh = float(self._thresholds.get("classifier_threshold", 0.5))
+            scale = float(self.cfg["model"].get("classifier_return_scale", 0.02))
+            pred_blended = (prob - clf_thresh) * scale
+            direction = "UP" if prob >= clf_thresh else "DOWN"
+        else:
+            pred_blended = self.meta_learner.predict(
+                lgbm_pred  = pred_lgbm,
+                xgb_pred   = pred_xgb,
+                arima_pred = pred_arima,
+                lstm_pred  = pred_lstm,
+            )
+            reg_thresh = float(self._thresholds.get("regressor_threshold", 0.0))
+            direction = "UP" if pred_blended >= reg_thresh else "DOWN"
 
         # Predicted price
         pred_price = current_price * np.exp(pred_blended)
-        direction  = "UP" if pred_blended >= 0 else "DOWN"
 
         # Confidence — blend individual base model confidences
         conf_lgbm = self.lgbm._compute_confidence(np.array([pred_lgbm]),  X_lgbm)
@@ -408,20 +534,36 @@ class Ensemble:
             except Exception as e:
                 logger.debug(f"[ensemble] LSTM historical predict failed: {e}")
 
-        # Meta-learner blend
-        pred_blended = self.meta_learner.predict_batch(
-            lgbm_preds  = pred_lgbm,
-            xgb_preds   = pred_xgb,
-            arima_preds = pred_arima,
-            lstm_preds  = pred_lstm,
-        )
+        # Choose classifier-based direction if configured and available
+        use_clf = bool(self.cfg["model"].get("use_meta_classifier", False)) and (self.meta_classifier is not None)
+        if use_clf:
+            preds_dict = {"lgbm": pred_lgbm, "xgb": pred_xgb, "arima": pred_arima}
+            if pred_lstm is not None:
+                preds_dict["lstm"] = pred_lstm
+            probs = self.meta_classifier.predict_proba(preds_dict)
+            clf_thresh = float(self._thresholds.get("classifier_threshold", 0.5))
+            scale = float(self.cfg["model"].get("classifier_return_scale", 0.02))
+            pred_blended = (probs - clf_thresh) * scale
+        else:
+            # Meta-learner blend
+            pred_blended = self.meta_learner.predict_batch(
+                lgbm_preds  = pred_lgbm,
+                xgb_preds   = pred_xgb,
+                arima_preds = pred_arima,
+                lstm_preds  = pred_lstm,
+            )
 
         result = pd.DataFrame(index=df.index)
         result["predicted_return"] = pred_blended
         result["lgbm_pred"]        = pred_lgbm
         result["xgb_pred"]         = pred_xgb
         result["arima_pred"]       = pred_arima
-        result["direction_pred"]   = (pred_blended >= 0).astype(int)
+        if use_clf:
+            result["direction_pred"] = (probs >= clf_thresh).astype(int)
+        else:
+            # If regressor blend used, convert via tuned regressor threshold (default 0)
+            reg_thresh = float(self._thresholds.get("regressor_threshold", 0.0))
+            result["direction_pred"] = (pred_blended >= reg_thresh).astype(int)
 
         if pred_lstm is not None:
             result["lstm_pred"] = pred_lstm

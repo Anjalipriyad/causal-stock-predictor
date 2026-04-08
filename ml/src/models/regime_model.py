@@ -153,12 +153,82 @@ class RegimeAwareEnsemble:
         regime_splits = self.splitter.split_all(df)
         regime_splits["neutral"] = df
 
+        # ------------------------------------------------------------------
+        # Train a dedicated crash model on all high-VIX rows if configured.
+        # This provides a specialized model for extreme-volatility days.
+        # ------------------------------------------------------------------
+        try:
+            vix_col = "india_vix" if "india_vix" in df.columns else ("vix_level" if "vix_level" in df.columns else None)
+            vix_thresh = int(self.cfg["model"].get("vix_crash_level", 30))
+            if vix_col is not None:
+                crash_df = df[df[vix_col] > vix_thresh]
+                if len(crash_df) > 0:
+                    logger.info(f"[regime_model] Found {len(crash_df)} crash rows (>{vix_thresh}). Training crash model...")
+                    try:
+                        from ml.src.ensemble import Ensemble
+                        from ml.src.evaluation.metrics import Metrics
+
+                        crash_ens = Ensemble(cfg=self.cfg)
+                        X_test_c, y_test_c = crash_ens.train_all(crash_df, f"{ticker}_crash", causal_features)
+                        test_df_c = pd.concat([X_test_c, y_test_c], axis=1)
+                        preds_c = crash_ens.predict_historical(test_df_c, causal_features)
+                        if "actual_return" in preds_c.columns:
+                            metrics = Metrics()
+                            scores_c = metrics.compute_all(preds_c["predicted_return"], preds_c["actual_return"], label="crash")
+                            results["crash"] = scores_c
+                        self._regime_ensembles["crash"] = crash_ens
+                        logger.info("[regime_model] Crash model trained and added as 'crash'.")
+                    except Exception as e:
+                        logger.warning(f"[regime_model] Crash model training failed: {e}")
+        except Exception:
+            # Non-fatal — continue with per-regime training
+            pass
+
         for regime_name, regime_df in regime_splits.items():
             if len(regime_df) < min_samples:
                 logger.warning(
-                    f"[regime_model] Skipping {regime_name} — "
-                    f"only {len(regime_df)} samples."
+                    f"[regime_model] Too few samples for {regime_name}: "
+                    f"{len(regime_df)} < {min_samples}. Trying simple fallback."
                 )
+
+                # Fallback to SimpleDirectionModel when there's not enough data
+                # for a full ensemble but enough for a small classifier.
+                simple_min = self.cfg["model"].get("simple_min_samples", 100)
+                if len(regime_df) < simple_min:
+                    logger.warning(
+                        f"[regime_model] Skipping {regime_name} — only {len(regime_df)} samples (< simple_min {simple_min})."
+                    )
+                    continue
+
+                logger.info(f"[regime_model] Using SimpleDirectionModel fallback for {regime_name} ({len(regime_df)} samples)")
+                try:
+                    from ml.src.models.simple_direction_model import SimpleDirectionModel
+
+                    simple = SimpleDirectionModel(cfg=self.cfg)
+                    X_test, y_test = simple.train_all(regime_df, f"{ticker}_{regime_name}", causal_features)
+
+                    # Evaluate simple model
+                    test_df = pd.concat([X_test, y_test], axis=1)
+                    preds = simple.predict_historical(test_df, causal_features)
+
+                    if "actual_return" in preds.columns:
+                        scores = metrics.compute_all(
+                            preds["predicted_return"],
+                            preds["actual_return"],
+                            label=f"{regime_name}",
+                        )
+                        results[regime_name] = scores
+
+                    # Persist simple model for later loading
+                    try:
+                        simple.save(f"{ticker}_{regime_name}", models_dir=str(self.models_dir))
+                    except Exception as e:
+                        logger.debug(f"[regime_model] Could not save simple model: {e}")
+
+                    self._regime_ensembles[regime_name] = simple
+                    logger.info(f"[regime_model] {regime_name} simple model trained.")
+                except Exception as e:
+                    logger.warning(f"[regime_model] Simple fallback for {regime_name} failed: {e}")
                 continue
 
             logger.info(
@@ -210,7 +280,17 @@ class RegimeAwareEnsemble:
         """
         Detect current regime and route to the appropriate model.
         """
+        # Override with crash routing when live VIX exceeds crash threshold
         regime = self.detector.detect(live_features)
+        try:
+            vix_val = live_features.get("india_vix", live_features.get("vix_level", 0.0))
+            vix_thresh = int(self.cfg["model"].get("vix_crash_level", 30))
+            if vix_val is not None and vix_val > vix_thresh and "crash" in self._regime_ensembles:
+                logger.info(f"[regime_model] Live VIX {vix_val} > {vix_thresh} — routing to 'crash' model")
+                regime = "crash"
+        except Exception:
+            pass
+
         logger.info(f"[regime_model] Detected regime: {regime}")
 
         # Fall back to neutral if regime model not available
@@ -251,7 +331,15 @@ class RegimeAwareEnsemble:
                 self._regime_ensembles[regime] = ensemble
                 logger.info(f"[regime_model] Loaded {regime} model.")
             except Exception as e:
-                logger.warning(f"[regime_model] Could not load {regime}: {e}")
+                logger.info(f"[regime_model] Ensemble load failed for {regime}: {e}. Trying simple model...")
+                try:
+                    from ml.src.models.simple_direction_model import SimpleDirectionModel
+
+                    simple = SimpleDirectionModel.load(f"{ticker}_{regime}", models_dir=str(self.models_dir))
+                    self._regime_ensembles[regime] = simple
+                    logger.info(f"[regime_model] Loaded simple model for {regime}.")
+                except Exception as e2:
+                    logger.warning(f"[regime_model] Could not load {regime}: {e2}")
 
     # -----------------------------------------------------------------------
     # Helpers

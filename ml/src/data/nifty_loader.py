@@ -201,11 +201,35 @@ class NiftyLoader:
         result["vix_change_1d"] = result["india_vix"].diff(1)
         result["vix_change_5d"] = result["india_vix"].diff(5)
 
+        # PE momentum / acceleration — helps disambiguate high PE driven by
+        # valuation vs momentum (PE rising quickly often signals a different
+        # regime than persistently high PE)
+        result["pe_change_5d"]   = result["pe_ratio"].diff(5)
+        result["pe_vs_1y_high"]  = (
+            result["pe_ratio"]
+            / result["pe_ratio"].rolling(252, min_periods=60).max()
+        )
+        result["pe_accel"]       = result["pe_change_5d"].diff(5)
+
         # Rolling moving averages (min_periods avoids NaN at the start of the series)
         result["vix_ma_5"]  = result["india_vix"].rolling(5,  min_periods=1).mean()
         result["vix_ma_10"] = result["india_vix"].rolling(10, min_periods=1).mean()
         result["pe_ma_10"]  = result["pe_ratio"].rolling(10,  min_periods=1).mean()
         result["pb_ma_10"]  = result["pb_ratio"].rolling(10,  min_periods=1).mean()
+
+        # VIX-derived extreme / crash signals
+        result["vix_delta_3d"]     = result["india_vix"].diff(3)
+        result["vix_extreme"]      = (result["india_vix"] > 40).astype(float)
+        result["vix_crash_signal"] = (
+            (result["india_vix"] > 40) & (result["vix_delta_3d"] > 5)
+        ).astype(float)
+
+        # QE / liquidity signal (when VIX is falling from high levels but PE
+        # remains elevated we may be in a liquidity-driven melt-up)
+        result["vix_falling"] = (result["vix_change_5d"] < -2).astype(float)
+        result["qe_signal"]    = (
+            result["vix_falling"].astype(float) * (result["pe_ratio"] > 22).astype(float)
+        ).astype(float)
 
         # Percentile ranks: where is today vs the past 252 trading days
         # min_periods=60 allows these to be computed after ~3 months of data
@@ -230,6 +254,19 @@ class NiftyLoader:
         # Valuation extremes
         result["market_expensive"] = (result["pe_ratio"] > 25).astype(float)
         result["market_cheap"]     = (result["pe_ratio"] < 15).astype(float)
+
+        # Additional long-window valuation feature: 5-year PE mean deviation
+        # computed here so it's available to downstream regime logic.
+        result["pe_vs_5y_mean"] = (
+            result["pe_ratio"]
+            / result["pe_ratio"].rolling(1260, min_periods=252).mean()
+            - 1.0
+        )
+
+        # VIX MA slope — measures whether stress is building or abating
+        result["vix_ma20_slope"] = (
+            result["india_vix"].rolling(20, min_periods=5).mean().diff(5)
+        )
 
         logger.info(
             f"[nifty_loader] Fundamental features: {len(result.columns)} cols, "
@@ -336,6 +373,20 @@ class NiftyLoader:
         # 3. Fundamental features (P/E, P/B, India VIX)
         fund_df = self.load_fundamental_features()
         fund_df = fund_df.reindex(tech_df.index).ffill(limit=5).fillna(0.0)
+
+        # 3b. Close vs 200-day MA — computed here because we have the price
+        # series available in this scope. Uses min_periods=60 (~3 months).
+        try:
+            close_vs_200 = (
+                price_df["close"]
+                / price_df["close"].rolling(200, min_periods=60).mean()
+                - 1.0
+            )
+            close_vs_200 = close_vs_200.reindex(tech_df.index).ffill(limit=5).fillna(0.0)
+            fund_df["close_vs_200ma"] = close_vs_200
+        except Exception:
+            # If anything goes wrong here, continue — feature is optional
+            logger.warning("[nifty_loader] Could not compute close_vs_200ma.")
 
         # 4. Sentiment (headline-based or precomputed fallback)
         sent_df = self.load_sentiment(use_finbert=use_finbert)

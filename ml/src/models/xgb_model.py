@@ -65,6 +65,7 @@ class XGBModel(BaseModel):
         y_train: pd.Series,
         X_val: Optional[pd.DataFrame] = None,
         y_val: Optional[pd.Series] = None,
+        sample_weight: Optional[np.ndarray] = None,
     ) -> None:
         """Train XGBoost model with optional early stopping."""
         logger.info(
@@ -74,7 +75,11 @@ class XGBModel(BaseModel):
 
         self._feature_names = list(X_train.columns)
 
-        dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=self._feature_names)
+        # Support optional sample weights for crash upweighting
+        if sample_weight is not None:
+            dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=self._feature_names, weight=sample_weight)
+        else:
+            dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=self._feature_names)
 
         evals = []
         if X_val is not None and y_val is not None:

@@ -163,11 +163,37 @@ model:
   target: "excess_return_5d"
   horizon_days: 5
 
+  # Chronological split ratios (train/val/test)
   train_ratio: 0.70
   val_ratio:   0.15
   test_ratio:  0.15
 
   scaler: "StandardScaler"
+
+  # Small-regime fallback and crash routing
+  simple_min_samples: 100         # when to use SimpleDirectionModel fallback
+  vix_crash_level: 30             # india_vix threshold to define crash dataset
+
+  # Sample weighting configuration (used to upweight crash / high-VIX rows)
+  sample_weighting:
+    enabled: true
+    method: "vix"
+    base_weight: 1.0
+    moderate_vix_threshold: 35
+    moderate_vix_weight: 3.0
+    extreme_vix_threshold: 50
+    extreme_vix_weight: 5.0
+
+  # Meta-classifier and threshold tuning
+  use_meta_classifier: true
+  classifier_return_scale: 0.02   # scale factor to map probability->pseudo-return
+  threshold_tuning:
+    regressor_grid_min: -0.05
+    regressor_grid_max: 0.05
+    regressor_grid_steps: 101
+    classifier_grid_min: 0.30
+    classifier_grid_max: 0.70
+    classifier_grid_steps: 41
 
   lgbm:
     n_estimators: 500

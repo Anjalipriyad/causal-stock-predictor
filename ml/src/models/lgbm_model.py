@@ -70,6 +70,7 @@ class LGBMModel(BaseModel):
         y_train: pd.Series,
         X_val: Optional[pd.DataFrame] = None,
         y_val: Optional[pd.Series] = None,
+        sample_weight: Optional[np.ndarray] = None,
     ) -> None:
         """Train LightGBM model with optional early stopping on validation set."""
         logger.info(
@@ -79,7 +80,11 @@ class LGBMModel(BaseModel):
 
         self._feature_names = list(X_train.columns)
 
-        dtrain = lgb.Dataset(X_train, label=y_train)
+        # Support optional sample weights (useful to upweight crash periods)
+        if sample_weight is not None:
+            dtrain = lgb.Dataset(X_train, label=y_train, weight=sample_weight)
+        else:
+            dtrain = lgb.Dataset(X_train, label=y_train)
 
         callbacks = [
             lgb.log_evaluation(period=50),
