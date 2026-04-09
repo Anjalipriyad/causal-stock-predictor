@@ -162,7 +162,7 @@ def main():
             return
 
         df = pd.read_csv(feat_path, index_col=0, parse_dates=True)
-        bt = Backtester()
+        bt = Backtester(market=args.market)
         try:
             causal_features = CausalSelector().load(args.ticker)
         except Exception:

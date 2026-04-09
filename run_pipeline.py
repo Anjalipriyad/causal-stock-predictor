@@ -186,9 +186,11 @@ def step3_causal_discovery(ticker: str) -> list[str]:
     # Select + save
     # Use union for NIFTY (less data = stricter intersection may find 0 features)
     # Use intersection for US stocks (15 years of data = strict selection is fine)
-    selector          = CausalSelector()
-    selector.strategy = "union" if is_nifty_ticker(ticker) else "intersection"
-    logger.info(f"[causal] Selection strategy: {selector.strategy}")
+    selector = CausalSelector()
+    # Keep selection strategy from config. The selector implements an
+    # adaptive fallback (relaxed p-value thresholds → union → top-pcmci)
+    # so explicit runtime switching to 'union' for NIFTY is unnecessary.
+    logger.info(f"[causal] Selection strategy (from config): {selector.strategy}")
     features = selector.select(ticker, granger_results, pcmci_results, save=True)
 
     print(f"\nFinal causal features ({len(features)}):")
@@ -208,14 +210,17 @@ def step4_train_models(ticker: str, causal_features: list[str]) -> None:
     df        = pd.read_csv(feat_path, index_col=0, parse_dates=True)
 
     # Override target for NIFTY
+    start = time.time()
+    # If NIFTY/India, use an explicit local config override (do NOT mutate global config)
     if is_nifty_ticker(ticker):
-        cfg = _load_config()
-        cfg["model"]["target"] = "log_return_5d"
-        logger.info("[train] NIFTY: using log_return_5d as target")
-
-    start          = time.time()
-    # Pass overridden config for NIFTY so the target column is correct
-    ensemble       = Ensemble(cfg=cfg) if is_nifty_ticker(ticker) else Ensemble()
+        import copy
+        cfg_base = _load_config()
+        cfg_local = copy.deepcopy(cfg_base)
+        cfg_local["model"]["target"] = "log_return_5d"
+        logger.info("[train] NIFTY: using log_return_5d as target (local override)")
+        ensemble = Ensemble(cfg=cfg_local)
+    else:
+        ensemble = Ensemble()
     X_test, y_test = ensemble.train_all(df, ticker, causal_features)
     logger.info(f"All models trained in {elapsed(start)}")
 
@@ -246,9 +251,11 @@ def step5_sample_prediction(
     # Determine config override for NIFTY (use log_return_5d instead of excess_return_5d)
     cfg = None
     if is_nifty_ticker(ticker) or market == "india":
-        cfg = _load_config()
+        import copy
+        cfg_base = _load_config()
+        cfg = copy.deepcopy(cfg_base)
         cfg["model"]["target"] = "log_return_5d"
-        logger.info("[train] NIFTY: using log_return_5d as target")
+        logger.info("[train] NIFTY/India: using log_return_5d as target (local override)")
 
     # NIFTY — skip live prediction (no real-time P/E, P/B, headlines available)
     # Live prediction quality would be misleading without the same data quality as training
@@ -371,8 +378,16 @@ def step6_regime_backtest(
 ) -> None:
     banner(f"STEP 6 — Full Regime Backtest / Paper Table ({ticker})")
     from ml.src.evaluation.backtester import Backtester
+    from ml.src.data.loader import _load_config
 
-    bt      = Backtester()
+    # If NIFTY/India market, pass a config override so target is correct
+    cfg = None
+    if is_nifty_ticker(ticker) or market == "india":
+        cfg = _load_config()
+        cfg["model"]["target"] = "log_return_5d"
+        logger.info("[regime_backtest] NIFTY/India: using log_return_5d as target")
+
+    bt = Backtester(cfg=cfg, market=market)
     results = bt.regime_backtest(df, ticker, causal_features)
 
     if results.empty:

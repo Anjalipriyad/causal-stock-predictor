@@ -51,7 +51,8 @@ def train_meta_classifier(ticker: str, market: str = "us") -> Dict:
     # Validation-set predictions from base learners
     val_lgbm = ensemble.lgbm.predict_raw(X_val_s)
     val_xgb  = ensemble.xgb.predict_raw(X_val_s)
-    val_arima = ensemble.arima.predict_raw(X_val)
+    # Give ARIMA the true validation targets so it can produce rolling forecasts
+    val_arima = ensemble.arima.predict_raw(X_val, y_true=y_val)
 
     X_meta = np.column_stack([val_lgbm, val_xgb, val_arima])
     scaler = StandardScaler().fit(X_meta)

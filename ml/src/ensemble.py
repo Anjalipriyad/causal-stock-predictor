@@ -216,6 +216,13 @@ class Ensemble:
         ticker = ticker.upper()
         logger.info(f"[ensemble] Training all models for {ticker} ...")
 
+        # Safety: ensure the target column is not present in the causal feature list
+        if self.target_col in causal_features:
+            logger.warning(
+                f"[ensemble] Removing target column '{self.target_col}' from causal_features to prevent leakage."
+            )
+            causal_features = [c for c in causal_features if c != self.target_col]
+
         # ── 1. Data split ──────────────────────────────────────────────────
         X_train, X_val, X_test, y_train, y_val, y_test = \
             self.lgbm.prepare_data(df, causal_features)
@@ -291,7 +298,8 @@ class Ensemble:
         # model's relative accuracy
         val_lgbm  = self.lgbm.predict_raw(X_val_s)
         val_xgb   = self.xgb.predict_raw(X_val_s)
-        val_arima = self.arima.predict_raw(X_val)
+        # Provide true validation targets so ARIMA can produce rolling forecasts
+        val_arima = self.arima.predict_raw(X_val, y_true=y_val)
 
         self.meta_learner.fit(
             lgbm_preds  = val_lgbm,
@@ -362,6 +370,20 @@ class Ensemble:
                 "regressor_da": float(best_r_score),
                 "classifier_threshold": best_c,
             }
+
+            # Optionally compute split-conformal quantile on validation residuals
+            try:
+                use_conf = bool(self.cfg["model"]["ensemble"].get("use_conformal", False))
+                if use_conf:
+                    alpha = float(self.cfg["model"]["ensemble"].get("conformal_alpha", 0.10))
+                    residuals = np.abs(val_blended - y_val.values)
+                    # Conformal quantile: 1 - alpha empirical quantile of abs residuals
+                    q = float(np.quantile(residuals, 1.0 - alpha))
+                    thresholds["conformal_q"] = q
+                    thresholds["conformal_alpha"] = alpha
+                    logger.info(f"[ensemble] Conformal quantile (1-alpha) computed: q={q:.6f} (alpha={alpha})")
+            except Exception as e:
+                logger.warning(f"[ensemble] Conformal quantile computation failed: {e}")
             path = self.models_dir / f"thresholds_{ticker}.json"
             with open(path, "w") as f:
                 json.dump(thresholds, f)
@@ -454,19 +476,35 @@ class Ensemble:
         # Predicted price
         pred_price = current_price * np.exp(pred_blended)
 
-        # Confidence — blend individual base model confidences
-        conf_lgbm = self.lgbm._compute_confidence(np.array([pred_lgbm]),  X_lgbm)
-        conf_xgb  = self.xgb._compute_confidence( np.array([pred_xgb]),   X_xgb)
-        # Weight confidence by meta-learner's learned emphasis
-        w         = self.cfg["model"]["ensemble"]["weights"]
-        confidence = w["lgbm"] * conf_lgbm + w["xgb"] * conf_xgb + w["arima"] * 0.5
-        confidence = float(np.clip(confidence, 0.3, 0.9))
+        # Confidence & bands — prefer split-conformal intervals if available
+        try:
+            conf_q = float(self._thresholds.get("conformal_q")) if self._thresholds else None
+        except Exception:
+            conf_q = None
 
-        # Confidence band
-        vol   = self.lgbm._estimate_volatility(X_lgbm)
-        z     = self.confidence_z
-        upper = current_price * np.exp(pred_blended + z * vol * np.sqrt(self.horizon))
-        lower = current_price * np.exp(pred_blended - z * vol * np.sqrt(self.horizon))
+        if conf_q is not None and conf_q > 0:
+            # Use conformal interval on log-return scale
+            alpha = float(self.cfg["model"]["ensemble"].get("conformal_alpha", 0.10))
+            conf_scale = float(self.cfg["model"]["ensemble"].get("conformal_conf_scale", 3.0))
+            # Confidence decreases as predicted magnitude grows relative to conformal width
+            confidence = 1.0 - min(abs(pred_blended) / (conf_scale * conf_q + 1e-12), 1.0)
+            confidence = float(np.clip(confidence, 0.3, 0.9))
+            upper = current_price * np.exp(pred_blended + conf_q)
+            lower = current_price * np.exp(pred_blended - conf_q)
+        else:
+            # Fallback: original volatility-based bands and blended confidences
+            conf_lgbm = self.lgbm._compute_confidence(np.array([pred_lgbm]),  X_lgbm)
+            conf_xgb  = self.xgb._compute_confidence( np.array([pred_xgb]),   X_xgb)
+            # Weight confidence by meta-learner's learned emphasis
+            w         = self.cfg["model"]["ensemble"]["weights"]
+            confidence = w["lgbm"] * conf_lgbm + w["xgb"] * conf_xgb + w["arima"] * 0.5
+            confidence = float(np.clip(confidence, 0.3, 0.9))
+
+            # Confidence band — volatility based
+            vol   = self.lgbm._estimate_volatility(X_lgbm)
+            z     = self.confidence_z
+            upper = current_price * np.exp(pred_blended + z * vol * np.sqrt(self.horizon))
+            lower = current_price * np.exp(pred_blended - z * vol * np.sqrt(self.horizon))
 
         # Causal drivers from LightGBM (SHAP-based, highest interpretability)
         drivers = self.lgbm._extract_drivers(X_lgbm, features)
@@ -524,7 +562,9 @@ class Ensemble:
         # Base model predictions
         pred_lgbm  = self.lgbm.predict_raw(X_lgbm)
         pred_xgb   = self.xgb.predict_raw(X_xgb)
-        pred_arima = self.arima.predict_raw(X)
+        # If actual targets are present, give them to ARIMA so it can simulate
+        # online forecasting (update with observed returns as it moves forward).
+        pred_arima = self.arima.predict_raw(X, y_true=y) if y is not None else self.arima.predict_raw(X)
 
         # Optional LSTM
         pred_lstm = None

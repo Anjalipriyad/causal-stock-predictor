@@ -229,12 +229,13 @@ class TestARIMAModel:
         assert len(preds) == len(X_te)
 
     def test_all_predictions_same_value(self, split_data):
-        """ARIMA gives one forecast — all rows get the same value."""
-        X_tr, _, X_te, y_tr, _, _ = split_data
+        """ARIMA should produce rolling forecasts (not a single repeated value)."""
+        X_tr, _, X_te, y_tr, _, y_te = split_data
         model = ARIMAModel()
         model.fit(X_tr, y_tr)
-        preds = model.predict_raw(X_te)
-        assert np.allclose(preds, preds[0])
+        # Provide the actual held-out test targets so predict_raw can update
+        preds = model.predict_raw(X_te, y_true=y_te)
+        assert not np.allclose(preds, preds[0])
 
     def test_save_and_load(self, tmp_path, split_data):
         X_tr, _, _, y_tr, _, _ = split_data

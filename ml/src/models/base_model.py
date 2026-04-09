@@ -195,14 +195,41 @@ class BaseModel(ABC):
         # Direction
         direction = "UP" if pred_return >= 0 else "DOWN"
 
-        # Confidence — based on prediction magnitude relative to recent volatility
-        confidence = self._compute_confidence(raw_preds, X)
+        # Attempt to load per-ticker thresholds (may include conformal quantile)
+        thresholds = {}
+        try:
+            import json
+            path = self.models_dir / f"thresholds_{ticker.upper()}.json"
+            if path.exists():
+                with open(path, "r") as f:
+                    thresholds = json.load(f)
+        except Exception:
+            thresholds = {}
 
-        # Confidence band
-        vol = self._estimate_volatility(X)
-        z   = self.confidence_z
-        upper = current_price * np.exp(pred_return + z * vol * np.sqrt(self.horizon))
-        lower = current_price * np.exp(pred_return - z * vol * np.sqrt(self.horizon))
+        # If conformal quantile present, use split-conformal bands on log-return scale
+        conf_q = thresholds.get("conformal_q") if isinstance(thresholds, dict) else None
+        if conf_q is not None:
+            try:
+                q = float(conf_q)
+                conf_scale = float(self.cfg["model"]["ensemble"].get("conformal_conf_scale", 3.0))
+                confidence = 1.0 - min(abs(pred_return) / (conf_scale * q + 1e-12), 1.0)
+                confidence = float(np.clip(confidence, 0.3, 0.9))
+                upper = current_price * np.exp(pred_return + q)
+                lower = current_price * np.exp(pred_return - q)
+            except Exception:
+                # Fallback to volatility-based if something goes wrong
+                confidence = self._compute_confidence(raw_preds, X)
+                vol = self._estimate_volatility(X)
+                z = self.confidence_z
+                upper = current_price * np.exp(pred_return + z * vol * np.sqrt(self.horizon))
+                lower = current_price * np.exp(pred_return - z * vol * np.sqrt(self.horizon))
+        else:
+            # Default behaviour: volatility-based confidence and bands
+            confidence = self._compute_confidence(raw_preds, X)
+            vol = self._estimate_volatility(X)
+            z = self.confidence_z
+            upper = current_price * np.exp(pred_return + z * vol * np.sqrt(self.horizon))
+            lower = current_price * np.exp(pred_return - z * vol * np.sqrt(self.horizon))
 
         # Causal drivers
         drivers = self._extract_drivers(X.iloc[[-1]], causal_features)

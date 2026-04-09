@@ -238,6 +238,10 @@ model:
       arima: 0.10
       tft:   0.30
     confidence_z: 1.645
+    # Conformal prediction options (split conformal on validation set)
+    use_conformal: true
+    conformal_alpha: 0.10        # desired miscoverage level (e.g. 0.10 -> 90% intervals)
+    conformal_conf_scale: 3.0    # scaling used to map conformal width -> confidence score
 
 # -----------------------------------------------------------------------------
 # Evaluation + backtesting

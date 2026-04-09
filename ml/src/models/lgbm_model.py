@@ -196,12 +196,29 @@ class LGBMModel(BaseModel):
             # Fall back to base class implementation
             return super()._extract_drivers(X_row, causal_features)
 
+        # Attempt to inverse-transform feature values so reported 'value'
+        # is in the original units (interpretable for the paper/report).
+        X_row_unscaled = X_row
+        try:
+            if hasattr(self, "_scaler") and self._scaler is not None:
+                inv = self._scaler.inverse_transform(X_row)
+                X_row_unscaled = pd.DataFrame(inv, index=X_row.index, columns=X_row.columns)
+        except Exception as e:
+            logger.debug(f"[lgbm] Could not inverse-transform features for drivers: {e}")
+            X_row_unscaled = X_row
+
         row = shap_df.iloc[0]
         drivers = []
         for feat, shap_val in row.items():
+            # Prefer unscaled value when available, fallback to scaled value
+            try:
+                raw_val = float(X_row_unscaled[feat].iloc[0]) if feat in X_row_unscaled.columns else float(X_row[feat].iloc[0])
+            except Exception:
+                raw_val = float(X_row[feat].iloc[0])
+
             drivers.append({
                 "feature": feat,
-                "value":   round(float(X_row[feat].iloc[0]), 4),
+                "value":   round(raw_val, 4),
                 "shap":    round(float(shap_val), 4),
                 "impact":  "positive" if shap_val > 0 else "negative",
             })

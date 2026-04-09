@@ -64,6 +64,7 @@ class CausalSelector:
     def __init__(self, config_path: Optional[str] = None, cfg: Optional[dict] = None):
         # Allow passing an already-loaded config dict to keep runtime overrides
         cfg = cfg if cfg is not None else _load_config(config_path)
+        self.cfg = cfg
         selector = cfg["causal"]["selector"]
 
         self.strategy           = selector["strategy"]
@@ -88,6 +89,7 @@ class CausalSelector:
         granger_results: dict[str, dict],
         pcmci_results: dict,
         save: bool = True,
+        force_adaptive: bool = False,
     ) -> list[str]:
         """
         Combine Granger + PCMCI results and return the final causal feature list.
@@ -110,36 +112,97 @@ class CausalSelector:
         # Build combined feature table
         table = self._build_table(granger_results, pcmci_results)
 
-        # Apply selection strategy
+        # Helper: return sorted feature list from a selection DataFrame
+        def _features_from_df(df_sel):
+            return df_sel.sort_values("pcmci_pval")["feature"].tolist()
+
+        feature_names = []
+        selection_info = {"method": self.strategy, "note": "initial"}
+
         if self.strategy == "intersection":
-            selected = table[
-                table["granger_causal"] & table["pcmci_causal"]
-            ]
+            # First try strict intersection using boolean causal flags
+            sel = table[table["granger_causal"] & table["pcmci_causal"]]
+            if len(sel) >= self.min_causal_features and not force_adaptive:
+                feature_names = _features_from_df(sel)
+                selection_info.update({"stage": "intersection_bool", "n": len(feature_names)})
+            else:
+                # Adaptive relaxation: try relaxed p-value thresholds
+                granger_sig = float(self.cfg.get("causal", {}).get("granger", {}).get("significance", 0.05))
+                pcmci_alpha = float(self.cfg.get("causal", {}).get("pcmci", {}).get("alpha_level", 0.01))
+
+                granger_thresholds = [granger_sig, min(0.1, max(granger_sig, 0.1))]
+                pcmci_thresholds = [pcmci_alpha, 0.02, 0.05]
+
+                found = False
+                stage = 0
+                for gth in granger_thresholds:
+                    for pth in pcmci_thresholds:
+                        stage += 1
+                        sel = table[(table["granger_pval"] <= gth) & (table["pcmci_pval"] <= pth)]
+                        if len(sel) >= self.min_causal_features:
+                            feature_names = _features_from_df(sel)
+                            selection_info.update({
+                                "method": "adaptive_intersection",
+                                "stage": stage,
+                                "granger_pval": gth,
+                                "pcmci_pval": pth,
+                                "n": len(feature_names),
+                            })
+                            found = True
+                            break
+                    if found:
+                        break
+
+                if not found:
+                    # Fall back to union (more permissive)
+                    sel_union = table[(table["granger_pval"] <= granger_sig) | (table["pcmci_pval"] <= pcmci_alpha)]
+                    if len(sel_union) >= self.min_causal_features:
+                        feature_names = _features_from_df(sel_union)
+                        selection_info.update({"method": "fallback_union", "n": len(feature_names)})
+                    else:
+                        # As a last resort, pick top features by PCMCI p-value
+                        fallback = table.sort_values("pcmci_pval")["feature"].tolist()
+                        # Ensure we have at least min_causal_features by taking top N
+                        if len(fallback) >= self.min_causal_features:
+                            feature_names = fallback[: self.min_causal_features]
+                            selection_info.update({"method": "fallback_top_pcmci", "n": len(feature_names)})
+                        else:
+                            raise ValueError(
+                                f"[selector] Only {len(fallback)} candidate features available for {ticker} (min={self.min_causal_features})."
+                            )
+
         elif self.strategy == "union":
-            selected = table[
-                table["granger_causal"] | table["pcmci_causal"]
-            ]
+            sel = table[table["granger_causal"] | table["pcmci_causal"]]
+            feature_names = _features_from_df(sel)
+            selection_info.update({"stage": "union_bool", "n": len(feature_names)})
+
         else:
             raise ValueError(
                 f"Unknown strategy '{self.strategy}'. Use 'intersection' or 'union'."
             )
 
-        # Sort by PCMCI p-value (most significant first)
-        selected = selected.sort_values("pcmci_pval")
-
-        # Enforce limits
-        feature_names = selected["feature"].tolist()
+        # Enforce limits (cap at max, ensure min satisfied)
+        # If feature_names is longer than max, _enforce_limits will cap it.
         feature_names = self._enforce_limits(feature_names, ticker)
 
-        # Build output record
+        # Build output record and attach selection metadata
         record = self._build_record(ticker, table, feature_names)
+        record["selection_info"] = selection_info
+        record["strategy_used"] = self.strategy
 
         if save:
             self._save(ticker, record)
 
+        # Expose last selection metadata for callers (useful for ablation scripts)
+        try:
+            self._last_selection_info = selection_info
+            self._last_selected_features = feature_names
+        except Exception:
+            pass
+
         logger.info(
             f"[selector] Final causal features for {ticker} "
-            f"({len(feature_names)}): {feature_names}"
+            f"({len(feature_names)}): {feature_names}  | info: {selection_info}"
         )
         return feature_names
 

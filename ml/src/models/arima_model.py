@@ -105,26 +105,95 @@ class ARIMAModel(BaseModel):
             f"AIC={self._model.aic():.2f}"
         )
 
-    def predict_raw(self, X: pd.DataFrame) -> np.ndarray:
+    def predict_raw(self, X: pd.DataFrame, y_true: Optional[pd.Series] = None) -> np.ndarray:
         """
-        Return n-step ARIMA forecasts.
-        X is used only to determine how many predictions to return (len(X)).
-        Each call re-forecasts from the end of the training series.
+        Produce rolling/recursive ARIMA forecasts for each row in X.
+
+        If `y_true` is provided (e.g., validation or historical test series),
+        the function will simulate online forecasting by updating the ARIMA
+        state with the observed true value after each prediction. If
+        `y_true` is not provided (live inference), the method will perform
+        recursive forecasting updating the local model with its own forecasts
+        so each step moves forward (no leakage).
         """
         if self._model is None:
             raise RuntimeError("[arima] Model not fitted.")
 
+        import copy
+
         n = len(X)
-        # Forecast horizon_days ahead, return the last n predictions
-        forecasts = self._model.predict(n_periods=self.horizon)
+        # Work on a copy of the fitted model so we don't mutate the persisted one
+        try:
+            model = copy.deepcopy(self._model)
+        except Exception:
+            # Fallback: operate on the fitted model (best-effort)
+            model = self._model
 
-        # pmdarima may return a pandas Series with DatetimeIndex — use iloc
-        if hasattr(forecasts, "iloc"):
-            last_val = float(forecasts.iloc[-1])
+        preds = []
+
+        # Align y_true if provided
+        if y_true is not None:
+            # Accept Series or array-like; use iloc for positional access
+            y_series = pd.Series(y_true).reset_index(drop=True)
         else:
-            last_val = float(forecasts[-1])
+            y_series = None
+        # Special-case: if auto_arima selected a trivial model (0,0,0)
+        # then fallback to a simple persistence-style online forecast so
+        # historical rolling predictions can vary when `y_true` is supplied.
+        try:
+            order = getattr(model, "order", None)
+        except Exception:
+            order = None
 
-        return np.full(n, last_val)
+        if order == (0, 0, 0):
+            last_obs = None
+            if hasattr(self, "_y_train") and self._y_train is not None and len(self._y_train) > 0:
+                try:
+                    last_obs = float(self._y_train.iloc[-1])
+                except Exception:
+                    last_obs = 0.0
+            else:
+                last_obs = 0.0
+
+            for i in range(n):
+                pred = float(last_obs)
+                preds.append(pred)
+                # update with observed true value if available, else use prediction
+                if y_series is not None and i < len(y_series):
+                    try:
+                        last_obs = float(y_series.iloc[i])
+                    except Exception:
+                        last_obs = pred
+                else:
+                    last_obs = pred
+
+            return np.array(preds)
+
+        for i in range(n):
+            # Forecast horizon steps ahead and take the horizon-th element
+            forecasts = model.predict(n_periods=self.horizon)
+            if hasattr(forecasts, "iloc"):
+                pred = float(forecasts.iloc[-1])
+            else:
+                pred = float(forecasts[-1])
+
+            preds.append(pred)
+
+            # Update the local model with the observed true value if available,
+            # otherwise update with the model's own forecast so the window moves.
+            try:
+                if y_series is not None and i < len(y_series):
+                    obs = float(y_series.iloc[i])
+                    model.update(np.array([obs]))
+                else:
+                    # No true observation available (live), update with prediction
+                    model.update(np.array([pred]))
+            except Exception:
+                # If update fails, continue — predictions will fall back to
+                # repeated multi-step forecasts from the current model state.
+                continue
+
+        return np.array(preds)
 
     def save(self, ticker: str) -> None:
         """Save ARIMA model to saved_models/."""

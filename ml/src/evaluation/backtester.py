@@ -42,6 +42,8 @@ from ml.src.ensemble import Ensemble
 from ml.src.evaluation.metrics import Metrics
 from ml.src.evaluation.regime_splitter import RegimeSplitter
 from ml.src.causal.selector import CausalSelector
+from ml.src.causal.granger import GrangerCausality
+from ml.src.causal.pcmci import PCMCIDiscovery
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +53,14 @@ class Backtester:
     Walk-forward and regime-split backtesting for the causal ensemble.
     """
 
-    def __init__(self, config_path: Optional[str] = None):
-        self.cfg      = _load_config(config_path)
-        self.metrics  = Metrics(config_path)
-        self.splitter = RegimeSplitter(config_path)
-        self.selector = CausalSelector(config_path)
+    def __init__(self, config_path: Optional[str] = None, cfg: Optional[dict] = None, market: Optional[str] = None):
+        # Allow passing an already-loaded config dict (for runtime overrides, e.g. NIFTY)
+        self.cfg = cfg if cfg is not None else _load_config(config_path)
+        self.metrics = Metrics(config_path)
+        # Pass market through to RegimeSplitter so India regimes can be used when needed
+        self.splitter = RegimeSplitter(config_path, market=market)
+        # CausalSelector accepts an optional cfg so pass through to keep overrides
+        self.selector = CausalSelector(config_path, cfg=self.cfg)
 
         bt = self.cfg["evaluation"]["backtest"]
         self.initial_train_years = bt["initial_train_years"]
@@ -197,54 +202,82 @@ class Backtester:
         regime_splits = self.splitter.split_all(df)
         results       = []
 
-        # Three model variants
-        model_variants = {
-            "pcmci_causal":  causal_features,
-            "all_features":  all_feature_cols,
-        }
+        # For each regime, train on pre-regime data and evaluate both:
+        #  - pcmci_causal: recompute causal features using only pre-regime train data
+        #  - all_features: baseline trained on all available features
+        for regime_name, regime_df in regime_splits.items():
+            if len(regime_df) < self.min_test_samples:
+                logger.warning(
+                    f"[backtester] Skipping {regime_name} — only {len(regime_df)} samples."
+                )
+                continue
 
-        for model_name, features in model_variants.items():
-            for regime_name, regime_df in regime_splits.items():
-                if len(regime_df) < self.min_test_samples:
-                    logger.warning(
-                        f"[backtester] Skipping {model_name}/{regime_name} "
-                        f"— only {len(regime_df)} samples."
-                    )
-                    continue
+            # Use pre-regime data for training if possible
+            regime_start = self.splitter.regimes[regime_name][0]
+            train_df     = df.loc[:regime_start].iloc[:-1]
 
-                # Use pre-regime data for training if possible
-                regime_start = self.splitter.regimes[regime_name][0]
-                train_df     = df.loc[:regime_start].iloc[:-1]
+            if len(train_df) < 200:
+                logger.warning(
+                    f"[backtester] Not enough training data for {regime_name}, skipping."
+                )
+                continue
 
-                if len(train_df) < 200:
-                    logger.warning(
-                        f"[backtester] Not enough training data for "
-                        f"{model_name}/{regime_name}, skipping."
-                    )
-                    continue
+            # ------------------ PCMCI causal variant ------------------
+            try:
+                # Granger on full pre-regime training set
+                granger = GrangerCausality()
+                granger_results = granger.run(train_df, target=self.target_col, verbose=False)
 
+                # PCMCI on last 50% of pre-regime training data (consistent with pipeline)
+                df_pcmci = train_df.iloc[-int(len(train_df) * 0.5):]
+                pcmci = PCMCIDiscovery()
+                pcmci_results = pcmci.run(df_pcmci, target=self.target_col)
+
+                # Select features using selector; do not overwrite saved global file
                 try:
-                    ensemble = Ensemble(config_path)
-                    ensemble.train_all(train_df, ticker, features)
-                    preds = ensemble.predict_historical(regime_df, features)
-
-                    if "actual_return" not in preds.columns:
-                        continue
-
-                    scores = self.metrics.compute_all(
-                        preds["predicted_return"],
-                        preds["actual_return"],
-                        label=f"{model_name}/{regime_name}",
-                    )
-                    scores["model"]  = model_name
-                    scores["regime"] = regime_name
-                    scores["n_test"] = len(regime_df)
-                    results.append(scores)
-
+                    features_pcmci = self.selector.select(ticker, granger_results, pcmci_results, save=False)
                 except Exception as e:
-                    logger.warning(
-                        f"[backtester] {model_name}/{regime_name} failed: {e}"
+                    logger.warning(f"[backtester] Causal selector failed for {regime_name}: {e}")
+                    features_pcmci = []
+
+                if features_pcmci:
+                    ensemble = Ensemble(config_path)
+                    ensemble.train_all(train_df, ticker, features_pcmci)
+                    preds = ensemble.predict_historical(regime_df, features_pcmci)
+                    if "actual_return" in preds.columns:
+                        scores = self.metrics.compute_all(
+                            preds["predicted_return"],
+                            preds["actual_return"],
+                            label=f"pcmci_causal/{regime_name}",
+                        )
+                        scores["model"] = "pcmci_causal"
+                        scores["regime"] = regime_name
+                        scores["n_test"] = len(regime_df)
+                        results.append(scores)
+                else:
+                    logger.warning(f"[backtester] No causal features for {regime_name}; skipping pcmci_causal.")
+
+            except Exception as e:
+                logger.warning(f"[backtester] pcmci_causal/{regime_name} failed: {e}")
+
+            # ------------------ All-features baseline ------------------
+            try:
+                ensemble_all = Ensemble(config_path)
+                ensemble_all.train_all(train_df, ticker, all_feature_cols)
+                preds_all = ensemble_all.predict_historical(regime_df, all_feature_cols)
+                if "actual_return" in preds_all.columns:
+                    scores_all = self.metrics.compute_all(
+                        preds_all["predicted_return"],
+                        preds_all["actual_return"],
+                        label=f"all_features/{regime_name}",
                     )
+                    scores_all["model"] = "all_features"
+                    scores_all["regime"] = regime_name
+                    scores_all["n_test"] = len(regime_df)
+                    results.append(scores_all)
+
+            except Exception as e:
+                logger.warning(f"[backtester] all_features/{regime_name} failed: {e}")
 
         # Random baseline
         for regime_name, regime_df in regime_splits.items():
