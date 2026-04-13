@@ -221,7 +221,7 @@ def step4_train_models(ticker: str, causal_features: list[str]) -> None:
         ensemble = Ensemble(cfg=cfg_local)
     else:
         ensemble = Ensemble()
-    X_test, y_test = ensemble.train_all(df, ticker, causal_features)
+    X_test, y_test = ensemble.train_all_corrected(df, ticker, causal_features)
     logger.info(f"All models trained in {elapsed(start)}")
 
     test_df = pd.concat([X_test, y_test], axis=1)

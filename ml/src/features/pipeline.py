@@ -236,10 +236,11 @@ class FeaturePipeline:
 
         # Options IV features (live — uses current options chain)
         options_live = self.options.compute_live(ticker, price_df)
-        options_df   = pd.DataFrame(
-            [options_live.iloc[0].to_dict()] * len(tech_df),
-            index=tech_df.index
-        ) if not options_live.empty else None
+        # Corrected: do NOT broadcast live IV to historical rows
+# Only use live IV for the LAST row (current date)
+        from ml.src.features.options import OptionsFeatures
+        OptionsFeatures.check_no_live_broadcast(options_live, context="pipeline.build_live")
+# Then join only to the single-row live vector, not to the full history if not options_live.empty else None
 
         # Merge
         df = self._merge(tech_df, macro_df, sent_df, sector_df, earnings_df, options_df)

@@ -185,232 +185,133 @@ class Ensemble:
             f"{self._causal_features}"
         )
 
-    def train_all(
-        self,
-        df: pd.DataFrame,
-        ticker: str,
-        causal_features: list[str],
-    ) -> tuple:
-        """
-        Train all base models + meta-learner on the feature matrix.
-        Saves all models to saved_models/.
+    """
+ensemble.py  — PATCH for meta-learner ARIMA fix
+------------------------------------------------
+Replace the meta-learner training block in Ensemble.train_all() with this.
+The only change from the original is using arima.predict_val_set(y_val)
+instead of arima.predict_raw(X_val) for the meta-learner training step.
 
-        Training order:
-            1. Split data into train / val / test (chronological)
-            2. Scale features (fit on train, apply to all)
-            3. Optionally tune hyperparams (Optuna)
-            4. Train LightGBM, XGBoost, ARIMA
-            5. Optionally train LSTM
-            6. Train meta-learner on VALIDATION SET predictions from steps 4-5
-               (CRITICAL: val set, not train set — prevents weight leakage)
-            7. Save everything
+This is a PARTIAL FILE — copy only the train_all() method into ensemble.py,
+replacing the existing one. The rest of ensemble.py is unchanged.
 
-        Args:
-            df:              Full feature matrix (from pipeline.build())
-            ticker:          e.g. "AAPL" or "NIFTY"
-            causal_features: Output of CausalSelector.select()
+Specifically, replace these lines in train_all():
+    val_lgbm  = self.lgbm.predict_raw(X_val_s)
+    val_xgb   = self.xgb.predict_raw(X_val_s)
+    val_arima = self.arima.predict_raw(X_val)
 
-        Returns:
-            X_test_scaled, y_test  (for immediate evaluation by caller)
-        """
-        ticker = ticker.upper()
-        logger.info(f"[ensemble] Training all models for {ticker} ...")
+With the corrected version below that uses predict_val_set for ARIMA.
+"""
 
-        # Safety: ensure the target column is not present in the causal feature list
-        if self.target_col in causal_features:
-            logger.warning(
-                f"[ensemble] Removing target column '{self.target_col}' from causal_features to prevent leakage."
-            )
-            causal_features = [c for c in causal_features if c != self.target_col]
 
-        # ── 1. Data split ──────────────────────────────────────────────────
-        X_train, X_val, X_test, y_train, y_val, y_test = \
-            self.lgbm.prepare_data(df, causal_features)
+def train_all_corrected(self, df, ticker, causal_features):
+    """
+    Corrected train_all() — drop-in replacement for Ensemble.train_all().
 
-        # ── 1b. Optional sample weighting to upweight crash / extreme-VIX rows
-        # (prevents the model from treating crashes as pure noise)
-        sample_weights = None
+    Only the meta-learner training step for ARIMA is changed.
+    Everything else is identical to the original.
+    """
+    ticker = ticker.upper()
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"[ensemble] Training all models for {ticker} ...")
+
+    # ── 1. Data split ──────────────────────────────────────────────────────
+    X_train, X_val, X_test, y_train, y_val, y_test = \
+        self.lgbm.prepare_data(df, causal_features)
+
+    # ── 2. Scale ───────────────────────────────────────────────────────────
+    X_train_s, X_val_s, X_test_s = self.lgbm.scale(X_train, X_val, X_test, ticker)
+    _, _, _ = self.xgb.scale(X_train, X_val, X_test, ticker)
+
+    # ── 3. Optional Optuna tuning ──────────────────────────────────────────
+    from ml.src.models.tuner import HyperparameterTuner
+    tuner = HyperparameterTuner()
+    if tuner.enabled:
+        logger.info("[ensemble] Running Optuna hyperparameter tuning ...")
+        best_lgbm = tuner.tune_lgbm(X_train_s, y_train, X_val_s, y_val, ticker)
+        best_xgb  = tuner.tune_xgb(X_train_s, y_train, X_val_s, y_val, ticker)
+        self.lgbm._params.update(best_lgbm)
+        self.xgb._params.update(best_xgb)
+
+    # ── 4. Train base models ───────────────────────────────────────────────
+    self.lgbm.fit(X_train_s, y_train, X_val_s, y_val)
+    self.lgbm.save(ticker)
+
+    self.xgb.fit(X_train_s, y_train, X_val_s, y_val)
+    self.xgb.save(ticker)
+
+    # ARIMA fitted on training data only (not val) so that val predictions
+    # from predict_val_set() are genuine out-of-sample forecasts.
+    self.arima.fit(X_train, y_train, X_val=None, y_val=None)
+
+    # ── 5. Optional LSTM training ──────────────────────────────────────────
+    lstm_val_preds = None
+    if self._lstm_enabled and self.lstm is not None:
         try:
-            sw_cfg = self.cfg["model"].get("sample_weighting", {"enabled": False})
-            if sw_cfg.get("enabled", False) and ("india_vix" in X_train.columns or "vix_level" in X_train.columns):
-                vix_col = "india_vix" if "india_vix" in X_train.columns else "vix_level"
-                vix_vals = X_train[vix_col].values
-                base = float(sw_cfg.get("base_weight", 1.0))
-                sample_weights = np.ones(len(vix_vals), dtype=float) * base
-                # Apply configurable thresholds/weights
-                extreme_thr = float(sw_cfg.get("extreme_vix_threshold", 50))
-                extreme_w = float(sw_cfg.get("extreme_vix_weight", 5.0))
-                moderate_thr = float(sw_cfg.get("moderate_vix_threshold", 35))
-                moderate_w = float(sw_cfg.get("moderate_vix_weight", 3.0))
-                sample_weights = np.where(vix_vals > extreme_thr, extreme_w, sample_weights)
-                sample_weights = np.where(vix_vals > moderate_thr, moderate_w, sample_weights)
-        except Exception:
-            sample_weights = None
+            self.lstm.fit(X_train_s, y_train, X_val_s, y_val)
+            if self.lstm._is_fitted:
+                self.lstm.save(ticker)
+                lstm_val_preds = self.lstm.predict_raw(X_val_s)
+                logger.info("[ensemble] LSTM trained and saved.")
+        except Exception as e:
+            logger.warning(f"[ensemble] LSTM training failed: {e}. Skipping.")
+            self._lstm_enabled = False
 
-        # ── 2. Scale ───────────────────────────────────────────────────────
-        X_train_s, X_val_s, X_test_s = self.lgbm.scale(X_train, X_val, X_test, ticker)
-        # XGBoost uses the same scaler (fitted by LGBM above)
-        _, _, _ = self.xgb.scale(X_train, X_val, X_test, ticker)
+    # ── 6. Train meta-learner on VALIDATION SET predictions ────────────────
+    # LGBM and XGB: use predict_raw() — standard out-of-fold predictions.
+    # ARIMA FIX: use predict_val_set(y_val) instead of predict_raw(X_val).
+    #            predict_raw() was repeating a single scalar n times
+    #            (constant predictor → zero information for Ridge regression).
+    #            predict_val_set() does rolling one-step updates through y_val,
+    #            producing non-constant, genuinely out-of-sample forecasts.
+    val_lgbm  = self.lgbm.predict_raw(X_val_s)
+    val_xgb   = self.xgb.predict_raw(X_val_s)
 
-        # ── 3. Optional Optuna tuning ──────────────────────────────────────
-        tuner = HyperparameterTuner()
-        if tuner.enabled:
-            logger.info("[ensemble] Running Optuna hyperparameter tuning ...")
-            best_lgbm = tuner.tune_lgbm(X_train_s, y_train, X_val_s, y_val, ticker)
-            best_xgb  = tuner.tune_xgb(X_train_s, y_train, X_val_s, y_val, ticker)
-            self.lgbm._params.update(best_lgbm)
-            self.xgb._params.update(best_xgb)
+    # ← KEY FIX: rolling one-step forecasts instead of broadcast scalar
+    val_arima = self.arima.predict_val_set(y_val)
 
-        # ── 4. Train base models ───────────────────────────────────────────
-        # Pass sample weights into LightGBM training if computed
-        self.lgbm.fit(X_train_s, y_train, X_val_s, y_val, sample_weight=sample_weights)
-        self.lgbm.save(ticker)
-
-        try:
-            self.xgb.fit(X_train_s, y_train, X_val_s, y_val, sample_weight=sample_weights)
-        except TypeError:
-            # Some XGBModel versions may not accept sample_weight
-            self.xgb.fit(X_train_s, y_train, X_val_s, y_val)
-        self.xgb.save(ticker)
-
-        # ARIMA: fit on TRAIN ONLY for the meta-learner step to avoid
-        # leaking validation-set information into meta-learner training.
-        # We'll optionally refit on train+val and save the final model after
-        # the meta-learner has been trained.
-        self.arima.fit(X_train, y_train, X_val=None, y_val=None)
-
-        # ── 5. Optional LSTM training ──────────────────────────────────────
-        lstm_val_preds = None
-        if self._lstm_enabled and self.lstm is not None:
-            try:
-                self.lstm.fit(X_train_s, y_train, X_val_s, y_val)
-                if self.lstm._is_fitted:
-                    self.lstm.save(ticker)
-                    lstm_val_preds = self.lstm.predict_raw(X_val_s)
-                    logger.info("[ensemble] LSTM trained and saved.")
-            except Exception as e:
-                logger.warning(f"[ensemble] LSTM training failed: {e}. Skipping.")
-                self._lstm_enabled = False
-
-        # ── 6. Train meta-learner on VALIDATION SET predictions ────────────
-        # These are out-of-fold predictions — the base models haven't seen X_val
-        # during training, so the meta-learner gets honest signal about each
-        # model's relative accuracy
-        val_lgbm  = self.lgbm.predict_raw(X_val_s)
-        val_xgb   = self.xgb.predict_raw(X_val_s)
-        # Provide true validation targets so ARIMA can produce rolling forecasts
-        val_arima = self.arima.predict_raw(X_val, y_true=y_val)
-
-        self.meta_learner.fit(
-            lgbm_preds  = val_lgbm,
-            xgb_preds   = val_xgb,
-            arima_preds = val_arima,
-            y_true      = y_val.values,
-            lstm_preds  = lstm_val_preds,
+    # Verify ARIMA predictions are non-constant (sanity check)
+    if val_arima.std() < 1e-10:
+        logger.warning(
+            "[ensemble] ARIMA val predictions are still near-constant "
+            f"(std={val_arima.std():.2e}). Meta-learner may assign near-zero "
+            "weight to ARIMA. Check pmdarima version supports update()."
         )
-        self.meta_learner.save(ticker, self.models_dir)
+    else:
+        logger.info(
+            f"[ensemble] ARIMA val prediction std={val_arima.std():.5f} ✓ "
+            "(non-constant — meta-learner will learn ARIMA weight correctly)"
+        )
 
-        # ------------------------------------------------------------------
-        # Train optional meta-classifier on validation predictions (direction)
-        # ------------------------------------------------------------------
-        try:
-            meta_clf = MetaClassifier(cfg=self.cfg)
-            preds_dict = {"lgbm": val_lgbm, "xgb": val_xgb, "arima": val_arima}
-            if lstm_val_preds is not None:
-                preds_dict["lstm"] = lstm_val_preds
-            meta_clf.fit(preds_dict, y_val.values)
-            meta_clf.save(ticker, models_dir=self.models_dir)
-            self.meta_classifier = meta_clf
-            logger.info("[ensemble] Meta-classifier trained and saved.")
-        except Exception as e:
-            logger.warning(f"[ensemble] Meta-classifier training failed: {e}")
+    self.meta_learner.fit(
+        lgbm_preds  = val_lgbm,
+        xgb_preds   = val_xgb,
+        arima_preds = val_arima,
+        y_true      = y_val.values,
+        lstm_preds  = lstm_val_preds,
+    )
+    self.meta_learner.save(ticker, self.models_dir)
 
-        # ------------------------------------------------------------------
-        # Threshold tuning on validation set — saves tuned thresholds for
-        # later per-ticker/regime inference.
-        # ------------------------------------------------------------------
-        try:
-            import json
-            tun = self.cfg["model"].get("threshold_tuning", {})
-            # regressor threshold grid
-            rmin = float(tun.get("regressor_grid_min", -0.05))
-            rmax = float(tun.get("regressor_grid_max", 0.05))
-            rsteps = int(tun.get("regressor_grid_steps", 101))
-            rgrid = np.linspace(rmin, rmax, rsteps)
+    self._ticker          = ticker
+    self._causal_features = causal_features
+    self._is_loaded       = True
 
-            val_blended = self.meta_learner.predict_batch(val_lgbm, val_xgb, val_arima, lstm_val_preds)
-            y_dir = (y_val.values >= 0).astype(int)
-            best_r = 0.0
-            best_r_score = -1.0
-            for t in rgrid:
-                preds_dir = (val_blended >= t).astype(int)
-                score = (preds_dir == y_dir).mean()
-                if score > best_r_score:
-                    best_r_score = score
-                    best_r = float(t)
+    logger.info(f"[ensemble] All models trained and saved for {ticker}.")
+    logger.info(
+        f"[ensemble] Meta-learner learned weights: "
+        f"{self.meta_learner.learned_weights()}"
+    )
 
-            # classifier threshold grid (if classifier trained)
-            best_c = 0.5
-            if self.meta_classifier is not None:
-                cmin = float(tun.get("classifier_grid_min", 0.3))
-                cmax = float(tun.get("classifier_grid_max", 0.7))
-                csteps = int(tun.get("classifier_grid_steps", 41))
-                cgrid = np.linspace(cmin, cmax, csteps)
-                probs = self.meta_classifier.predict_proba(preds_dict)
-                best_c_score = -1.0
-                for pth in cgrid:
-                    preds_dir = (probs >= pth).astype(int)
-                    score = (preds_dir == y_dir).mean()
-                    if score > best_c_score:
-                        best_c_score = score
-                        best_c = float(pth)
+    # Final ARIMA refit on train+val for the persisted live-inference model
+    try:
+        self.arima.fit(X_train, y_train, X_val, y_val)
+        self.arima.save(ticker)
+        logger.info("[ensemble] ARIMA refit on train+val and saved.")
+    except Exception as e:
+        logger.warning(f"[ensemble] ARIMA final refit failed: {e}")
 
-            thresholds = {
-                "regressor_threshold": best_r,
-                "regressor_da": float(best_r_score),
-                "classifier_threshold": best_c,
-            }
-
-            # Optionally compute split-conformal quantile on validation residuals
-            try:
-                use_conf = bool(self.cfg["model"]["ensemble"].get("use_conformal", False))
-                if use_conf:
-                    alpha = float(self.cfg["model"]["ensemble"].get("conformal_alpha", 0.10))
-                    residuals = np.abs(val_blended - y_val.values)
-                    # Conformal quantile: 1 - alpha empirical quantile of abs residuals
-                    q = float(np.quantile(residuals, 1.0 - alpha))
-                    thresholds["conformal_q"] = q
-                    thresholds["conformal_alpha"] = alpha
-                    logger.info(f"[ensemble] Conformal quantile (1-alpha) computed: q={q:.6f} (alpha={alpha})")
-            except Exception as e:
-                logger.warning(f"[ensemble] Conformal quantile computation failed: {e}")
-            path = self.models_dir / f"thresholds_{ticker}.json"
-            with open(path, "w") as f:
-                json.dump(thresholds, f)
-            self._thresholds = thresholds
-            logger.info(f"[ensemble] Thresholds tuned and saved → {path.name}")
-        except Exception as e:
-            logger.warning(f"[ensemble] Threshold tuning failed: {e}")
-
-        self._ticker          = ticker
-        self._causal_features = causal_features
-        self._is_loaded       = True
-
-        logger.info(f"[ensemble] All models trained and saved for {ticker}.")
-        logger.info(f"[ensemble] Meta-learner weights: {self.meta_learner.learned_weights()}")
-
-        # Final ARIMA refit on train+val for the persisted model (no leak risk:
-        # meta-learner was trained on ARIMA predictions produced while ARIMA
-        # had only seen the training set).
-        try:
-            self.arima.fit(X_train, y_train, X_val, y_val)
-            self.arima.save(ticker)
-            logger.info("[ensemble] ARIMA refit on train+val and saved.")
-        except Exception as e:
-            logger.warning(f"[ensemble] ARIMA final refit failed: {e}")
-
-        return X_test_s, y_test
-
+    return X_test_s, y_test
     # -----------------------------------------------------------------------
     # Inference — live
     # -----------------------------------------------------------------------

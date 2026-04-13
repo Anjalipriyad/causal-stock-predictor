@@ -52,6 +52,7 @@ import numpy as np
 import pandas as pd
 
 from ml.src.data.loader import _load_config
+from ml.src.features.nifty_feature_guard import apply_nifty_feature_guard_to_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -400,7 +401,10 @@ class NiftyLoader:
         df = tech_df.copy()
         df = df.join(fund_df, how="left")
         df = df.join(sent_df, how="left")
-
+        # After: df = df.join(sent_df, how="left")
+# Add:
+        from ml.src.features.nifty_feature_guard import apply_nifty_feature_guard_to_pipeline
+        df = apply_nifty_feature_guard_to_pipeline(df)
         # 6. Final cleanup
         df = df.ffill(limit=5).fillna(0.0)
 

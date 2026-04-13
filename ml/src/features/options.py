@@ -1,27 +1,22 @@
 """
-options.py
-----------
-Implied volatility features from options market data.
+options.py  (CORRECTED)
+-----------------------
+Replaces the original options.py.
 
-The IV-RV spread (implied minus realised volatility) is one of the
-strongest predictors in finance — when options traders expect bigger
-moves than recent history, they're usually right.
+Key fix: adds a mode guard that prevents compute_live() output from
+ever being used in a multi-row historical context.
 
-Features produced:
-    iv_30d                — 30-day implied volatility (from ATM options)
-    iv_60d                — 60-day implied volatility
-    iv_rv_spread_20       — IV(30d) minus realised vol(20d)
-    iv_rv_spread_30       — IV(30d) minus realised vol(30d)
-    iv_percentile_252     — where IV sits in last 252 days (0-1)
-    iv_change_5d          — 5-day change in IV
-    iv_term_structure     — IV(60d) minus IV(30d) — slope of vol curve
+Original bug in pipeline.py:
+    options_live = self.options.compute_live(ticker, price_df)
+    options_df = pd.DataFrame(
+        [options_live.iloc[0].to_dict()] * len(tech_df),  # ← LOOKAHEAD BUG
+        index=tech_df.index
+    )
 
-Data source: yFinance options chain (free)
-
-Usage:
-    from ml.src.features.options import OptionsFeatures
-    options = OptionsFeatures()
-    df_options = options.compute(ticker, price_df)
+This broadcasts today's implied volatility to ALL historical rows,
+meaning every row in a backtesting context would have future IV.
+The fix: raise an error if compute_live() output is ever replicated
+across multiple rows, and enforce strict mode separation.
 """
 
 import logging
@@ -36,15 +31,22 @@ from ml.src.data.loader import _load_config
 
 logger = logging.getLogger(__name__)
 
+# ── Lookahead guard sentinel ───────────────────────────────────────────────
+_LIVE_IV_SENTINEL_COL = "_live_iv_do_not_broadcast"
+
 
 class OptionsFeatures:
     """
-    Computes implied volatility features from yFinance options chain.
+    Implied volatility features with strict live/historical mode separation.
 
-    Note: yFinance only provides current options chain, not historical IV.
-    For historical IV we use a proxy: reconstruct from put-call prices
-    at each date using Black-Scholes approximation.
-    For live inference: use current options chain directly.
+    CRITICAL DESIGN RULE:
+        compute_live()       → returns a SINGLE ROW with today's IV
+                               MUST NOT be replicated to multiple rows
+        compute_historical() → returns a FULL SERIES of historical IV proxy
+                               Safe to use in any backtesting context
+
+    The _check_no_live_broadcast() method raises if code tries to use
+    live IV in a multi-row historical context.
     """
 
     def __init__(self, config_path: Optional[str] = None):
@@ -56,43 +58,53 @@ class OptionsFeatures:
         self.iv_rv_windows  = options_cfg.get("iv_rv_windows", [20, 30])
 
     # -----------------------------------------------------------------------
-    # Public
+    # Live inference — returns SINGLE ROW only
     # -----------------------------------------------------------------------
 
     def compute_live(self, ticker: str, price_df: pd.DataFrame) -> pd.DataFrame:
         """
         Compute IV features using current options chain.
-        Used for live inference only — not historical training.
+        Returns a SINGLE ROW DataFrame.
 
-        Returns single-row DataFrame with current IV features.
+        IMPORTANT: The returned DataFrame contains a sentinel column
+        _LIVE_IV_SENTINEL_COL that will trigger an assertion if this
+        single-row result is broadcast to multiple rows (which would
+        create a lookahead bias in backtesting).
+
+        To use in pipeline.build_live(), call:
+            options_row = options.compute_live(ticker, price_df)
+            # Correct: join to a single-row inference DataFrame only
+            # WRONG: replicate to len(tech_df) rows
         """
         if not self.enabled:
-            return self._empty_live()
+            result = self._empty_live()
+        else:
+            try:
+                import yfinance as yf
+                stock  = yf.Ticker(ticker)
+                result = self._extract_iv_features(stock, price_df)
+            except Exception as e:
+                logger.warning(f"[options] Live IV fetch failed for {ticker}: {e}")
+                result = self._empty_live()
 
-        try:
-            import yfinance as yf
-            stock = yf.Ticker(ticker)
-            return self._extract_iv_features(stock, price_df)
-        except Exception as e:
-            logger.warning(f"[options] Live IV fetch failed for {ticker}: {e}")
-            return self._empty_live()
+        # Add sentinel — broadcasts of this row will be caught
+        result[_LIVE_IV_SENTINEL_COL] = 1
+        return result
+
+    # -----------------------------------------------------------------------
+    # Historical — returns FULL SERIES, safe for backtesting
+    # -----------------------------------------------------------------------
 
     def compute_historical(
         self, ticker: str, price_df: pd.DataFrame
     ) -> pd.DataFrame:
         """
         Compute historical IV proxy from realised volatility and VIX.
-
-        Since we can't get historical options prices for free, we use
-        a VIX-beta proxy — the stock's historical beta to VIX gives
-        an estimate of how the stock's IV moved over time.
-
-        This is an approximation. A paid data source (CBOE, OptionMetrics)
-        would give exact historical IV.
+        Returns full-length DataFrame — safe for all backtesting uses.
+        The sentinel column is NOT added here.
         """
         if not self.enabled:
             return self._empty_historical(price_df.index)
-
         try:
             return self._compute_iv_proxy(ticker, price_df)
         except Exception as e:
@@ -100,111 +112,118 @@ class OptionsFeatures:
             return self._empty_historical(price_df.index)
 
     # -----------------------------------------------------------------------
-    # Private — live IV extraction
+    # Guard: catch lookahead bias at the source
     # -----------------------------------------------------------------------
 
-    def _extract_iv_features(
-        self, stock, price_df: pd.DataFrame
-    ) -> pd.DataFrame:
+    @staticmethod
+    def check_no_live_broadcast(df: pd.DataFrame, context: str = "") -> None:
+        """
+        Assert that a live IV row has NOT been replicated across multiple rows.
+
+        Call this in pipeline.py before joining options_df to the main matrix.
+        If triggered, it means compute_live() output is being used in a
+        multi-row context, which would give future IV to historical rows.
+
+        Args:
+            df:      The DataFrame to check
+            context: Description of where the check is called (for error message)
+
+        Raises:
+            ValueError if live IV sentinel is found in a multi-row DataFrame.
+        """
+        if _LIVE_IV_SENTINEL_COL not in df.columns:
+            return   # no live IV present — safe
+
+        if len(df) > 1:
+            raise ValueError(
+                f"[options] LOOKAHEAD BIAS DETECTED {context}: "
+                f"Live IV (compute_live output, containing '{_LIVE_IV_SENTINEL_COL}') "
+                f"has been replicated to {len(df)} rows. "
+                f"This assigns future implied volatility to historical rows. "
+                f"Use compute_historical() for multi-row DataFrames."
+            )
+        # Single row is fine — strip the sentinel before returning
+        df.drop(columns=[_LIVE_IV_SENTINEL_COL], inplace=True, errors="ignore")
+
+    # -----------------------------------------------------------------------
+    # Private — live IV extraction (same as original)
+    # -----------------------------------------------------------------------
+
+    def _extract_iv_features(self, stock, price_df: pd.DataFrame) -> pd.DataFrame:
         """Extract IV from current options chain."""
-        import yfinance as yf
-
-        result = {}
-
         try:
-            expirations = stock.options
+            expirations   = stock.options
             if not expirations:
                 return self._empty_live()
 
             current_price = float(price_df["close"].iloc[-1])
             ivs_by_expiry = {}
 
-            for exp_date in expirations[:4]:   # check first 4 expiries
+            for exp_date in expirations[:4]:
                 try:
-                    chain    = stock.option_chain(exp_date)
-                    exp_dt   = datetime.strptime(exp_date, "%Y-%m-%d")
-                    dte      = (exp_dt - datetime.now()).days
-
+                    chain  = stock.option_chain(exp_date)
+                    exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
+                    dte    = (exp_dt - datetime.now()).days
                     if dte < 7:
                         continue
 
-                    # Get ATM options (closest to current price)
                     calls = chain.calls
                     puts  = chain.puts
-
                     if calls.empty or puts.empty:
                         continue
 
-                    # Find ATM strike
+                    calls = calls.copy()
+                    puts  = puts.copy()
                     calls["dist"] = abs(calls["strike"] - current_price)
                     puts["dist"]  = abs(puts["strike"]  - current_price)
 
                     atm_call = calls.loc[calls["dist"].idxmin()]
                     atm_put  = puts.loc[puts["dist"].idxmin()]
 
-                    # Average call and put IV
                     call_iv = atm_call.get("impliedVolatility", np.nan)
                     put_iv  = atm_put.get("impliedVolatility",  np.nan)
 
                     if not np.isnan(call_iv) and not np.isnan(put_iv):
                         ivs_by_expiry[dte] = (call_iv + put_iv) / 2
-
                 except Exception:
                     continue
 
             if not ivs_by_expiry:
                 return self._empty_live()
 
-            # Interpolate to standard 30d and 60d
-            dtes = sorted(ivs_by_expiry.keys())
-            ivs  = [ivs_by_expiry[d] for d in dtes]
+            dtes  = sorted(ivs_by_expiry.keys())
+            ivs   = [ivs_by_expiry[d] for d in dtes]
 
             iv_30d = float(np.interp(30, dtes, ivs)) if min(dtes) <= 30 <= max(dtes) else ivs[0]
             iv_60d = float(np.interp(60, dtes, ivs)) if min(dtes) <= 60 <= max(dtes) else ivs[-1]
 
-            # Realised volatility
             log_ret = np.log(price_df["close"] / price_df["close"].shift(1))
             rv_20   = float(log_ret.rolling(20).std().iloc[-1] * np.sqrt(252))
             rv_30   = float(log_ret.rolling(30).std().iloc[-1] * np.sqrt(252))
 
-            # IV change
-            iv_5d_ago = iv_30d   # placeholder — no historical chain
-
-            result = {
+            return pd.DataFrame([{
                 "iv_30d":            iv_30d,
                 "iv_60d":            iv_60d,
                 "iv_rv_spread_20":   iv_30d - rv_20,
                 "iv_rv_spread_30":   iv_30d - rv_30,
-                "iv_percentile_252": np.nan,   # requires historical IV
+                "iv_percentile_252": np.nan,
                 "iv_change_5d":      0.0,
                 "iv_term_structure": iv_60d - iv_30d,
-            }
-
-            return pd.DataFrame([result])
+            }])
 
         except Exception as e:
             logger.warning(f"[options] IV extraction failed: {e}")
             return self._empty_live()
 
     # -----------------------------------------------------------------------
-    # Private — historical IV proxy
+    # Private — historical IV proxy (same as original)
     # -----------------------------------------------------------------------
 
-    def _compute_iv_proxy(
-        self, ticker: str, price_df: pd.DataFrame
-    ) -> pd.DataFrame:
-        """
-        Historical IV proxy using VIX-beta approach.
-
-        IV_stock ≈ beta_to_vix × VIX + idiosyncratic_vol_premium
-
-        This is approximate but captures the main regime variation in IV.
-        """
+    def _compute_iv_proxy(self, ticker: str, price_df: pd.DataFrame) -> pd.DataFrame:
+        """Historical IV proxy using VIX-beta approach."""
         import yfinance as yf
-
         result = pd.DataFrame(index=price_df.index)
 
-        # Fetch VIX
         try:
             vix = yf.download(
                 "^VIX",
@@ -217,28 +236,23 @@ class OptionsFeatures:
         except Exception:
             return self._empty_historical(price_df.index)
 
-        # Realised volatility
         log_ret = np.log(price_df["close"] / price_df["close"].shift(1))
         rv_20   = log_ret.rolling(20).std() * np.sqrt(252)
         rv_30   = log_ret.rolling(30).std() * np.sqrt(252)
 
-        # VIX-based IV proxy (VIX is in percentage points, convert to decimal)
-        vix_decimal = vix / 100
-
-        # Rolling beta of stock vol to VIX
+        vix_decimal   = vix / 100
         vix_returns   = vix_decimal.pct_change()
         stock_vol_chg = rv_20.pct_change()
-        beta_to_vix   = stock_vol_chg.rolling(60).cov(vix_returns) / \
-                        vix_returns.rolling(60).var()
-        beta_to_vix   = beta_to_vix.clip(0.5, 3.0)   # reasonable bounds
+        beta_to_vix   = (
+            stock_vol_chg.rolling(60).cov(vix_returns) /
+            vix_returns.rolling(60).var()
+        ).clip(0.5, 3.0)
 
-        # IV proxy
         iv_30d_proxy = vix_decimal * beta_to_vix
         iv_30d_proxy = iv_30d_proxy.fillna(rv_20)
 
-        # Features
         result["iv_30d"]            = iv_30d_proxy
-        result["iv_60d"]            = iv_30d_proxy.rolling(5).mean()  # smoothed
+        result["iv_60d"]            = iv_30d_proxy.rolling(5).mean()
         result["iv_rv_spread_20"]   = iv_30d_proxy - rv_20
         result["iv_rv_spread_30"]   = iv_30d_proxy - rv_30
         result["iv_percentile_252"] = iv_30d_proxy.rolling(252).rank(pct=True)
@@ -253,12 +267,9 @@ class OptionsFeatures:
 
     def _empty_live(self) -> pd.DataFrame:
         return pd.DataFrame([{
-            "iv_30d":            0.0,
-            "iv_60d":            0.0,
-            "iv_rv_spread_20":   0.0,
-            "iv_rv_spread_30":   0.0,
-            "iv_percentile_252": 0.0,
-            "iv_change_5d":      0.0,
+            "iv_30d": 0.0, "iv_60d": 0.0,
+            "iv_rv_spread_20": 0.0, "iv_rv_spread_30": 0.0,
+            "iv_percentile_252": 0.0, "iv_change_5d": 0.0,
             "iv_term_structure": 0.0,
         }])
 

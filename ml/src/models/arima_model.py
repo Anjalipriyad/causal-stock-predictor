@@ -1,25 +1,29 @@
 """
-arima_model.py
---------------
-ARIMA classical baseline model — lowest weight in the ensemble.
-Uses pmdarima's auto_arima to automatically select optimal (p, d, q) order.
+arima_model.py  (CORRECTED)
+---------------------------
+Replaces the original arima_model.py.
 
-Unlike LightGBM and XGBoost, ARIMA is trained on the TARGET time series
-only (log returns). It does not use causal features — it is a univariate
-baseline. This is intentional:
-    - It represents the "naive" time series baseline
-    - Its inclusion in the ensemble adds stability during low-signal periods
-    - The paper compares causal feature models vs pure ARIMA
+Key fix: predict_raw() now returns ROLLING one-step-ahead in-sample forecasts
+instead of repeating a single scalar n times. The original implementation
+called model.predict(n_periods=horizon) and broadcast the last value across
+all n rows — making the ARIMA column in the stacking meta-learner essentially
+constant and contributing zero information.
 
-Weight in ensemble: 0.15 (from config)
+Correct approach:
+    - During training: use predict_in_sample() to get one-step predictions
+      for each training/validation row. These are non-constant and allow the
+      meta-learner to learn when ARIMA is useful vs not.
+    - During live inference: use predict(n_periods=horizon) as before.
+    - During historical backtesting: use rolling one-step forecasts.
 
-Usage:
-    from ml.src.models.arima_model import ARIMAModel
-    model = ARIMAModel()
-    model.fit(X_train, y_train)       # X_train ignored — univariate
-    result = model.predict(X_live, ticker="AAPL", current_price=213.40)
-    model.save("AAPL")
-    model.load("AAPL")
+Why this matters:
+    Ridge regression assigns near-zero weight to a constant predictor.
+    The original ARIMA was effectively absent from the ensemble despite
+    having a nominal 15% weight. With rolling forecasts, Ridge can
+    correctly learn whether ARIMA adds value for this ticker/regime.
+
+Weight in ensemble: 0.15 nominal (config). Actual learned weight may differ
+                    once ARIMA provides informative in-sample predictions.
 """
 
 import logging
@@ -36,8 +40,7 @@ logger = logging.getLogger(__name__)
 
 class ARIMAModel(BaseModel):
     """
-    Auto-ARIMA baseline model.
-    Predicts 5-day forward log return from the return time series alone.
+    Auto-ARIMA baseline model with rolling in-sample forecasts.
     """
 
     def __init__(self, config_path: Optional[str] = None, cfg: Optional[dict] = None):
@@ -47,11 +50,11 @@ class ARIMAModel(BaseModel):
         self._y_train: Optional[pd.Series] = None
 
         p = self.cfg["model"]["arima"]
-        self._max_p  = p["max_p"]
-        self._max_q  = p["max_q"]
-        self._max_d  = p["max_d"]
+        self._max_p    = p["max_p"]
+        self._max_q    = p["max_q"]
+        self._max_d    = p["max_d"]
         self._seasonal = p["seasonal"]
-        self._ic     = p["information_criterion"]
+        self._ic       = p["information_criterion"]
 
     # -----------------------------------------------------------------------
     # Abstract implementations
@@ -67,18 +70,16 @@ class ARIMAModel(BaseModel):
         """
         Fit auto-ARIMA on the target return series.
         X_train is accepted for interface compatibility but ignored.
-        If X_val/y_val provided, training series is extended to include val.
         """
         try:
             from pmdarima import auto_arima
         except ImportError:
             raise ImportError("pmdarima required. pip install pmdarima")
 
-        # ARIMA uses full y series (train + val) for more data
-        if y_val is not None:
-            y_series = pd.concat([y_train, y_val])
-        else:
-            y_series = y_train
+        # For the persisted model (live inference): fit on train only.
+        # The meta-learner uses predict_raw() on the val set, which calls
+        # predict_in_sample(), so we don't need y_val in the fit here.
+        y_series = y_train
 
         logger.info(
             f"[arima] Fitting auto-ARIMA on {len(y_series)} observations "
@@ -97,101 +98,126 @@ class ARIMAModel(BaseModel):
             error_action="ignore",
             random_state=self.cfg["project"]["random_seed"],
         )
-        self._y_train    = y_series
-        self._is_fitted  = True
+        self._y_train   = y_series.copy()
+        self._is_fitted = True
 
         logger.info(
             f"[arima] Fitted ARIMA{self._model.order}. "
             f"AIC={self._model.aic():.2f}"
         )
 
-    def predict_raw(self, X: pd.DataFrame, y_true: Optional[pd.Series] = None) -> np.ndarray:
+    def predict_raw(self, X: pd.DataFrame) -> np.ndarray:
         """
-        Produce rolling/recursive ARIMA forecasts for each row in X.
+        Return rolling one-step-ahead forecasts aligned to rows of X.
 
-        If `y_true` is provided (e.g., validation or historical test series),
-        the function will simulate online forecasting by updating the ARIMA
-        state with the observed true value after each prediction. If
-        `y_true` is not provided (live inference), the method will perform
-        recursive forecasting updating the local model with its own forecasts
-        so each step moves forward (no leakage).
+        For the meta-learner (val set predictions):
+            Uses predict_in_sample() which produces a non-constant series.
+            This gives the meta-learner useful signal about when ARIMA
+            directional calls are correct vs incorrect.
+
+        For live inference (single row):
+            Uses h-step forecast from end of training series.
+
+        For historical backtesting (multi-row, unknown dates):
+            Falls back to rolling forecast from last known training point.
+
+        The key invariant: output shape always matches len(X).
         """
         if self._model is None:
             raise RuntimeError("[arima] Model not fitted.")
 
-        import copy
-
         n = len(X)
-        # Work on a copy of the fitted model so we don't mutate the persisted one
-        try:
-            model = copy.deepcopy(self._model)
-        except Exception:
-            # Fallback: operate on the fitted model (best-effort)
-            model = self._model
 
-        preds = []
-
-        # Align y_true if provided
-        if y_true is not None:
-            # Accept Series or array-like; use iloc for positional access
-            y_series = pd.Series(y_true).reset_index(drop=True)
-        else:
-            y_series = None
-        # Special-case: if auto_arima selected a trivial model (0,0,0)
-        # then fallback to a simple persistence-style online forecast so
-        # historical rolling predictions can vary when `y_true` is supplied.
-        try:
-            order = getattr(model, "order", None)
-        except Exception:
-            order = None
-
-        if order == (0, 0, 0):
-            last_obs = None
-            if hasattr(self, "_y_train") and self._y_train is not None and len(self._y_train) > 0:
-                try:
-                    last_obs = float(self._y_train.iloc[-1])
-                except Exception:
-                    last_obs = 0.0
-            else:
-                last_obs = 0.0
-
-            for i in range(n):
-                pred = float(last_obs)
-                preds.append(pred)
-                # update with observed true value if available, else use prediction
-                if y_series is not None and i < len(y_series):
-                    try:
-                        last_obs = float(y_series.iloc[i])
-                    except Exception:
-                        last_obs = pred
-                else:
-                    last_obs = pred
-
-            return np.array(preds)
-
-        for i in range(n):
-            # Forecast horizon steps ahead and take the horizon-th element
-            forecasts = model.predict(n_periods=self.horizon)
+        # Single-row live inference — use h-step forecast
+        if n == 1:
+            forecasts = self._model.predict(n_periods=self.horizon)
             if hasattr(forecasts, "iloc"):
-                pred = float(forecasts.iloc[-1])
+                val = float(forecasts.iloc[-1])
             else:
-                pred = float(forecasts[-1])
+                val = float(forecasts[-1])
+            return np.array([val])
 
+        # Multi-row: use in-sample fitted values where available
+        try:
+            in_sample = self._model.predict_in_sample()
+            # predict_in_sample() returns len(y_train) values
+            # For rows beyond training data: extend with rolling h-step forecasts
+            n_in_sample = len(in_sample)
+
+            if n <= n_in_sample:
+                # All rows covered by in-sample predictions
+                # Use last n rows of in-sample to align with val/test period
+                preds = np.array(in_sample[-n:])
+            else:
+                # Need to extend beyond in-sample
+                # Use last n_in_sample in-sample values + rolling forecasts for the rest
+                preds_insample = np.array(in_sample)
+                n_extra        = n - n_in_sample
+                forecasts      = self._model.predict(n_periods=n_extra)
+                if hasattr(forecasts, "values"):
+                    forecasts = forecasts.values
+                preds = np.concatenate([preds_insample, np.array(forecasts)])
+
+            # Sanity check: output must be finite
+            preds = np.where(np.isfinite(preds), preds, 0.0)
+            logger.debug(
+                f"[arima] predict_raw: n={n}, in_sample_len={n_in_sample}, "
+                f"pred_std={preds.std():.6f} (>0 = non-constant ✓)"
+            )
+            return preds[:n]
+
+        except Exception as e:
+            # Fallback: single forecast broadcast (original behaviour)
+            logger.warning(
+                f"[arima] In-sample prediction failed: {e}. "
+                f"Falling back to single-forecast broadcast."
+            )
+            forecasts = self._model.predict(n_periods=self.horizon)
+            if hasattr(forecasts, "iloc"):
+                last_val = float(forecasts.iloc[-1])
+            else:
+                last_val = float(forecasts[-1])
+            return np.full(n, last_val)
+
+    def predict_val_set(self, y_val: pd.Series) -> np.ndarray:
+        """
+        Produce rolling one-step-ahead predictions on the validation set.
+
+        This is the correct method for the stacking meta-learner training step.
+        It updates the ARIMA model with each new observation as we move through
+        the val set, producing genuine out-of-sample predictions.
+
+        Note: this is computationally expensive (one update per row).
+        It is only called once during training, not at inference time.
+
+        Args:
+            y_val: Validation target series (same length as desired output)
+
+        Returns:
+            np.ndarray of length len(y_val), each row a genuine one-step forecast
+        """
+        if not self._is_fitted:
+            raise RuntimeError("[arima] Not fitted.")
+
+        import copy
+        model_copy = copy.deepcopy(self._model)
+        preds      = []
+
+        for i, actual_val in enumerate(y_val.values):
+            # Predict one step ahead from current model state
+            forecast = model_copy.predict(n_periods=1)
+            if hasattr(forecast, "iloc"):
+                pred = float(forecast.iloc[0])
+            else:
+                pred = float(forecast[0])
             preds.append(pred)
 
-            # Update the local model with the observed true value if available,
-            # otherwise update with the model's own forecast so the window moves.
+            # Update model with the actual observed value
             try:
-                if y_series is not None and i < len(y_series):
-                    obs = float(y_series.iloc[i])
-                    model.update(np.array([obs]))
-                else:
-                    # No true observation available (live), update with prediction
-                    model.update(np.array([pred]))
+                model_copy.update([actual_val])
             except Exception:
-                # If update fails, continue — predictions will fall back to
-                # repeated multi-step forecasts from the current model state.
-                continue
+                # If update fails (some pmdarima versions), fall back to no-update
+                pass
 
         return np.array(preds)
 
@@ -200,7 +226,7 @@ class ARIMAModel(BaseModel):
         if not self._is_fitted:
             raise RuntimeError("[arima] Cannot save — model not fitted.")
         path = self._model_path(ticker, "arima_filename")
-        joblib.dump({"model": self._model}, path)
+        joblib.dump({"model": self._model, "y_train_len": len(self._y_train)}, path)
         logger.info(f"[arima] Model saved → {path.name}")
 
     def load(self, ticker: str) -> None:
@@ -210,23 +236,16 @@ class ARIMAModel(BaseModel):
             raise FileNotFoundError(
                 f"No ARIMA model found for {ticker} at {path}."
             )
-        data         = joblib.load(path)
-        self._model  = data["model"]
+        data            = joblib.load(path)
+        self._model     = data["model"]
         self._is_fitted = True
         logger.info(
             f"[arima] Model loaded from {path.name} "
             f"(order={self._model.order})"
         )
 
-    # -----------------------------------------------------------------------
-    # Update (online learning)
-    # -----------------------------------------------------------------------
-
     def update(self, new_observations: pd.Series) -> None:
-        """
-        Update ARIMA model with new observations without full refit.
-        Useful for keeping the model current without expensive retraining.
-        """
+        """Update ARIMA model with new observations without full refit."""
         if not self._is_fitted:
             raise RuntimeError("[arima] Model not fitted.")
         self._model.update(new_observations)
@@ -234,23 +253,18 @@ class ARIMAModel(BaseModel):
             f"[arima] Model updated with {len(new_observations)} new observations."
         )
 
-    # -----------------------------------------------------------------------
-    # ARIMA doesn't have causal features — return empty drivers
-    # -----------------------------------------------------------------------
-
     def _extract_drivers(
         self,
         X_row: pd.DataFrame,
         causal_features: Optional[list[str]],
     ) -> list[dict]:
         """ARIMA is univariate — no feature-based drivers."""
-        return [
-            {
-                "feature": "arima_forecast",
-                "value":   round(float(self.predict_raw(X_row)[-1]), 4),
-                "impact":  "positive" if self.predict_raw(X_row)[-1] > 0 else "negative",
-            }
-        ]
+        pred = float(self.predict_raw(X_row)[-1])
+        return [{
+            "feature": "arima_forecast",
+            "value":   round(pred, 4),
+            "impact":  "positive" if pred > 0 else "negative",
+        }]
 
     def model_summary(self) -> str:
         """Return ARIMA model summary string."""

@@ -1,30 +1,27 @@
 """
-metrics.py
-----------
-All evaluation metrics used in the paper.
+metrics.py  (CORRECTED)
+-----------------------
+Replaces the original metrics.py.
 
-Metrics computed:
-    directional_accuracy   — % of correct UP/DOWN calls
-    sharpe_ratio           — annualised risk-adjusted return
-    rmse                   — root mean squared error on log returns
-    mae                    — mean absolute error on log returns
-    r2_score               — coefficient of determination on log returns
-    mape                   — mean absolute percentage error on log returns
-    max_drawdown           — worst peak-to-trough equity curve drop
-    calmar_ratio           — annualised return / max drawdown
+Key fixes:
+    1. sharpe_ratio(): adds turnover-aware transaction costs.
+       Original applied 10bps on EVERY period regardless of whether
+       the model changed direction. This overstates costs when the model
+       holds the same direction for multiple periods in a row.
+       Fix: only charge 10bps when direction changes (actual turnover).
 
-mae and r2_score are added to match the regression paper's evaluation
-methodology. Note: R² on log returns will typically be low (0.01-0.10 is
-considered good for financial return prediction) — this is normal and
-expected. Do NOT compare to R² scores on raw price levels, which are
-artificially inflated by price level trends.
+    2. sharpe_ratio_scaled(): new method using confidence-weighted positions.
+       Original used binary ±1 positions. Real strategies scale position
+       size by predicted return magnitude or confidence. This method
+       shows what a practitioner would actually achieve.
 
-Usage:
-    from ml.src.evaluation.metrics import Metrics
-    m = Metrics()
+    3. r2_score(): added explicit note about expected range for log returns
+       (0.01-0.10 is good — don't compare to price-level R²).
 
-    scores = m.compute_all(y_pred, y_true)
-    print(scores)
+    4. mae() and r2_score() are always included in compute_all() output
+       (required for the paper's regression evaluation methodology).
+
+All original methods preserved with same signatures — backward compatible.
 """
 
 import logging
@@ -40,8 +37,8 @@ logger = logging.getLogger(__name__)
 
 class Metrics:
     """
-    Computes all evaluation metrics from predicted and actual return series.
-    All config-driven — thresholds and constants read from config.yaml.
+    All evaluation metrics used in the paper.
+    Backward compatible with the original — all method signatures unchanged.
     """
 
     def __init__(self, config_path: Optional[str] = None):
@@ -55,7 +52,7 @@ class Metrics:
         self.metrics_list    = cfg["evaluation"]["metrics"]
 
     # -----------------------------------------------------------------------
-    # Public — compute all at once
+    # compute_all
     # -----------------------------------------------------------------------
 
     def compute_all(
@@ -64,11 +61,7 @@ class Metrics:
         y_true: pd.Series,
         label: str = "",
     ) -> dict[str, float]:
-        """
-        Compute all configured metrics and return as a dict.
-        Also always includes mae and r2_score regardless of config,
-        as these are required for the regression paper evaluation.
-        """
+        """Compute all configured metrics. Backward compatible."""
         y_pred, y_true = self._align(y_pred, y_true)
         scores = {}
 
@@ -76,12 +69,13 @@ class Metrics:
             scores["directional_accuracy"] = self.directional_accuracy(y_pred, y_true)
 
         if "sharpe_ratio" in self.metrics_list:
+            # Use turnover-aware Sharpe (corrected version)
             scores["sharpe_ratio"] = self.sharpe_ratio(y_pred, y_true)
 
         if "rmse" in self.metrics_list:
             scores["rmse"] = self.rmse(y_pred, y_true)
 
-        # MAE and R² always included (required for regression paper)
+        # Always include mae and r2 for regression paper evaluation
         scores["mae"]      = self.mae(y_pred, y_true)
         scores["r2_score"] = self.r2_score(y_pred, y_true)
 
@@ -102,20 +96,20 @@ class Metrics:
         return scores
 
     # -----------------------------------------------------------------------
-    # Individual metrics
+    # directional_accuracy
     # -----------------------------------------------------------------------
 
     def directional_accuracy(
         self, y_pred: pd.Series, y_true: pd.Series
     ) -> float:
-        """
-        Percentage of predictions with correct UP/DOWN direction.
-        Random baseline = 0.50. Anything above 0.55 consistently is meaningful.
-        Returns float in [0, 1].
-        """
+        """Percentage of correct UP/DOWN direction calls. Random = 0.50."""
         y_pred, y_true = self._align(y_pred, y_true)
         correct = ((y_pred >= 0) == (y_true >= 0)).sum()
         return float(correct / len(y_true))
+
+    # -----------------------------------------------------------------------
+    # sharpe_ratio — CORRECTED with turnover-aware costs
+    # -----------------------------------------------------------------------
 
     def sharpe_ratio(
         self,
@@ -123,10 +117,60 @@ class Metrics:
         y_true: pd.Series,
     ) -> float:
         """
-        Annualised Sharpe ratio of a simple long/short strategy.
-        Strategy: LONG when prediction is UP, SHORT when DOWN.
-        Transaction cost applied on every prediction period.
-        Returns float (can be negative).
+        Annualised Sharpe ratio of a long/short strategy.
+
+        FIX vs original: transaction costs are only charged when the
+        model CHANGES direction (actual turnover), not on every period.
+
+        Original bug: applied 10bps every 5 trading days regardless
+        of direction change. This was equivalent to 600bps/year in
+        costs even if the model held the same direction continuously.
+        That overstated the impact of transaction costs.
+
+        Corrected: charge 10bps only on periods where sign(pred[t]) ≠ sign(pred[t-1]).
+        This better reflects the actual cost of a signal-following strategy.
+        """
+        y_pred, y_true = self._align(y_pred, y_true)
+        positions  = np.where(y_pred >= 0, 1, -1)
+        strat_rets = positions * y_true
+
+        # ── CORRECTED: turnover-aware transaction costs ────────────────────
+        # Turnover occurs when direction changes: sign flips from +1 to -1 or vice versa
+        direction_changes  = np.diff(positions, prepend=positions[0])
+        turned_over        = np.abs(direction_changes) > 0
+        tx_cost_per_period = (self.tx_cost_bps / 10_000) * turned_over.astype(float)
+        strat_rets_net     = strat_rets - tx_cost_per_period
+
+        # Original used a flat cost every period — kept here as a comment
+        # for comparison in the paper:
+        # strat_rets_net = strat_rets - (self.tx_cost_bps / 10_000)
+
+        daily_rf = self.risk_free_rate / self.trading_days
+        excess   = strat_rets_net - daily_rf
+        std      = strat_rets_net.std()
+
+        if std == 0 or np.isnan(std):
+            return 0.0
+
+        sharpe = float((excess.mean() / std) * np.sqrt(self.trading_days))
+
+        # Log turnover stats for transparency
+        n_trades   = int(turned_over.sum())
+        turnover_pct = n_trades / len(positions) * 100
+        logger.debug(
+            f"[metrics] Sharpe={sharpe:.4f}, turnover={n_trades}/{len(positions)} "
+            f"periods ({turnover_pct:.1f}%)"
+        )
+        return sharpe
+
+    def sharpe_ratio_original(
+        self,
+        y_pred: pd.Series,
+        y_true: pd.Series,
+    ) -> float:
+        """
+        Original Sharpe ratio with flat 10bps cost every period.
+        Kept for comparison in the paper — shows original vs corrected.
         """
         y_pred, y_true = self._align(y_pred, y_true)
         positions  = np.where(y_pred >= 0, 1, -1)
@@ -138,49 +182,74 @@ class Metrics:
             return 0.0
         return float((excess.mean() / std) * np.sqrt(self.trading_days))
 
-    def rmse(
-        self, y_pred: pd.Series, y_true: pd.Series
+    def sharpe_ratio_scaled(
+        self,
+        y_pred:      pd.Series,
+        y_true:      pd.Series,
+        confidence:  Optional[pd.Series] = None,
     ) -> float:
         """
-        Root Mean Squared Error on log returns.
-        Lower is better. Heavily penalises large errors.
-        Returns float >= 0.
+        Confidence-weighted Sharpe ratio.
+
+        Instead of binary ±1 positions, scales position size by the
+        model's calibrated confidence (or by |predicted return| if
+        confidence is not provided).
+
+        This reflects real-world usage: a practitioner would size
+        positions larger when the model is more confident.
+
+        Args:
+            y_pred:     Predicted returns
+            y_true:     Actual returns
+            confidence: Calibrated confidence scores (0-1).
+                        If None, uses |y_pred| normalised to [0, 1].
+
+        Returns:
+            Annualised Sharpe ratio with scaled positions.
         """
+        y_pred, y_true = self._align(y_pred, y_true)
+
+        if confidence is not None:
+            conf, _ = self._align(confidence, y_true)
+            scale   = conf.values
+        else:
+            # Use normalised |predicted return| as position scale
+            abs_pred = np.abs(y_pred.values)
+            max_pred = abs_pred.max()
+            scale    = abs_pred / max_pred if max_pred > 0 else np.ones_like(abs_pred)
+
+        positions  = np.sign(y_pred.values) * scale
+        strat_rets = positions * y_true.values
+
+        # Turnover-aware costs
+        prev_pos  = np.roll(positions, 1)
+        prev_pos[0] = 0.0
+        turnover  = np.abs(positions - prev_pos)
+        strat_rets_net = strat_rets - (self.tx_cost_bps / 10_000) * turnover
+
+        daily_rf = self.risk_free_rate / self.trading_days
+        excess   = strat_rets_net - daily_rf
+        std      = strat_rets_net.std()
+        if std == 0 or np.isnan(std):
+            return 0.0
+        return float((excess.mean() / std) * np.sqrt(self.trading_days))
+
+    # -----------------------------------------------------------------------
+    # rmse, mae, r2_score, mape — unchanged from original
+    # -----------------------------------------------------------------------
+
+    def rmse(self, y_pred: pd.Series, y_true: pd.Series) -> float:
         y_pred, y_true = self._align(y_pred, y_true)
         return float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
 
-    def mae(
-        self, y_pred: pd.Series, y_true: pd.Series
-    ) -> float:
-        """
-        Mean Absolute Error on log returns.
-        Average magnitude of prediction error.
-        Less sensitive to large outliers than RMSE.
-        Returns float >= 0.
-
-        Interpretation for Nifty:
-            If log return is ~0.01 (1%) daily, MAE of 0.005 means the model
-            is off by about 0.5% on average — roughly half a percent per day.
-        """
+    def mae(self, y_pred: pd.Series, y_true: pd.Series) -> float:
         y_pred, y_true = self._align(y_pred, y_true)
         return float(np.mean(np.abs(y_pred - y_true)))
 
-    def r2_score(
-        self, y_pred: pd.Series, y_true: pd.Series
-    ) -> float:
+    def r2_score(self, y_pred: pd.Series, y_true: pd.Series) -> float:
         """
-        R² (coefficient of determination) on log returns.
-
-        Values:
-            1.0  = perfect prediction
-            0.0  = model is no better than predicting the mean
-            <0.0 = model is worse than predicting the mean
-
-        IMPORTANT: R² on LOG RETURNS is expected to be low (0.01-0.10 is good).
-        This is normal for financial return prediction — returns have very low
-        signal-to-noise. Do NOT compare this R² to values from price-level
-        regression (which are artificially inflated by price trends and would
-        be ~0.99 for any naive model).
+        R² on log returns. Expected range: 0.01-0.10 is GOOD for financial
+        return prediction. Do NOT compare to price-level R² (~0.99).
         """
         y_pred, y_true = self._align(y_pred, y_true)
         ss_res = np.sum((y_true - y_pred) ** 2)
@@ -193,22 +262,11 @@ class Metrics:
         self, y_pred: pd.Series, y_true: pd.Series,
         epsilon: float = 1e-8,
     ) -> float:
-        """
-        Mean Absolute Percentage Error on log returns.
-        Uses epsilon to avoid division by zero on near-zero returns.
-        Returns float >= 0 (as a ratio, not %).
-        """
         y_pred, y_true = self._align(y_pred, y_true)
         denom = np.abs(y_true) + epsilon
         return float(np.mean(np.abs(y_pred - y_true) / denom))
 
-    def max_drawdown(
-        self, y_pred: pd.Series, y_true: pd.Series,
-    ) -> float:
-        """
-        Maximum drawdown of the long/short strategy equity curve.
-        Returns float in [-1, 0] (negative — drawdown is a loss).
-        """
+    def max_drawdown(self, y_pred: pd.Series, y_true: pd.Series) -> float:
         y_pred, y_true = self._align(y_pred, y_true)
         positions  = np.where(y_pred >= 0, 1, -1)
         strat_rets = positions * y_true
@@ -217,13 +275,7 @@ class Metrics:
         dd         = (equity - peak) / peak
         return float(dd.min())
 
-    def calmar_ratio(
-        self, y_pred: pd.Series, y_true: pd.Series,
-    ) -> float:
-        """
-        Calmar ratio = annualised return / abs(max drawdown).
-        Higher is better. Returns float (can be negative).
-        """
+    def calmar_ratio(self, y_pred: pd.Series, y_true: pd.Series) -> float:
         y_pred, y_true = self._align(y_pred, y_true)
         positions      = np.where(y_pred >= 0, 1, -1)
         strat_rets     = positions * y_true
@@ -234,18 +286,14 @@ class Metrics:
         return float(annual_return / mdd)
 
     # -----------------------------------------------------------------------
-    # Comparison table — for paper
+    # Comparison table and baseline random
     # -----------------------------------------------------------------------
 
     def comparison_table(
-        self,
-        results: dict[str, dict[str, float]],
+        self, results: dict[str, dict[str, float]]
     ) -> pd.DataFrame:
-        """
-        Build a comparison table of metrics across multiple models/regimes.
-        This is Table 2 in the paper.
-        """
-        df = pd.DataFrame(results).T
+        """Build paper comparison table from multiple model result dicts."""
+        df       = pd.DataFrame(results).T
         df.index.name = "model"
         pct_cols   = ["directional_accuracy", "max_drawdown"]
         float_cols = ["sharpe_ratio", "calmar_ratio", "rmse", "mae", "r2_score", "mape"]
@@ -257,26 +305,8 @@ class Metrics:
                 df[col] = df[col].map(lambda x: f"{x:.4f}")
         return df
 
-    # -----------------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------------
-
-    def _align(
-        self, y_pred: pd.Series, y_true: pd.Series
-    ) -> tuple[pd.Series, pd.Series]:
-        """Align pred and true on common index, drop NaN rows."""
-        if isinstance(y_pred, np.ndarray):
-            y_pred = pd.Series(y_pred)
-        if isinstance(y_true, np.ndarray):
-            y_true = pd.Series(y_true)
-        combined = pd.concat([y_pred, y_true], axis=1).dropna()
-        return combined.iloc[:, 0], combined.iloc[:, 1]
-
     def baseline_random(self, y_true: pd.Series, n_trials: int = 1000) -> dict:
-        """
-        Compute expected metrics for a random direction predictor.
-        Useful for establishing statistical significance in the paper.
-        """
+        """Expected metrics for a random direction predictor (bootstrap)."""
         rng    = np.random.default_rng(42)
         scores = []
         for _ in range(n_trials):
@@ -291,3 +321,17 @@ class Metrics:
             result[f"{k}_mean"] = float(np.mean(vals))
             result[f"{k}_std"]  = float(np.std(vals))
         return result
+
+    # -----------------------------------------------------------------------
+    # Private
+    # -----------------------------------------------------------------------
+
+    def _align(
+        self, y_pred: pd.Series, y_true: pd.Series
+    ) -> tuple[pd.Series, pd.Series]:
+        if isinstance(y_pred, np.ndarray):
+            y_pred = pd.Series(y_pred)
+        if isinstance(y_true, np.ndarray):
+            y_true = pd.Series(y_true)
+        combined = pd.concat([y_pred, y_true], axis=1).dropna()
+        return combined.iloc[:, 0], combined.iloc[:, 1]
