@@ -105,7 +105,7 @@ def step1_load_data(ticker: str, skip: bool, market: str = "us") -> None:
     logger.info(f"Data loaded in {elapsed(start)}")
 
 
-def step2_build_features(ticker: str, force: bool, market: str = "us") -> None:
+def step2_build_features(ticker: str, force: bool, market: str = "us", use_finbert: bool | None = None) -> None:
     banner(f"STEP 2 — Feature Engineering ({ticker})")
     start = time.time()
 
@@ -118,7 +118,10 @@ def step2_build_features(ticker: str, force: bool, market: str = "us") -> None:
             logger.info("Nifty feature matrix exists — skipping build.")
             return
         cfg    = _load_config()
-        use_fb = cfg["features"].get("finbert", {}).get("enabled", False)
+        if use_finbert is None:
+            use_fb = cfg["features"].get("finbert", {}).get("enabled", False)
+        else:
+            use_fb = bool(use_finbert)
         df     = loader.build_feature_matrix(use_finbert=use_fb)
     else:
         from ml.src.features.pipeline import FeaturePipeline
@@ -187,10 +190,7 @@ def step3_causal_discovery(ticker: str) -> list[str]:
     # Use union for NIFTY (less data = stricter intersection may find 0 features)
     # Use intersection for US stocks (15 years of data = strict selection is fine)
     selector = CausalSelector()
-    # Keep selection strategy from config. The selector implements an
-    # adaptive fallback (relaxed p-value thresholds → union → top-pcmci)
-    # so explicit runtime switching to 'union' for NIFTY is unnecessary.
-    logger.info(f"[causal] Selection strategy (from config): {selector.strategy}")
+    logger.info(f"[causal] Selection strategy: {selector.strategy}")
     features = selector.select(ticker, granger_results, pcmci_results, save=True)
 
     print(f"\nFinal causal features ({len(features)}):")
@@ -221,7 +221,7 @@ def step4_train_models(ticker: str, causal_features: list[str]) -> None:
         ensemble = Ensemble(cfg=cfg_local)
     else:
         ensemble = Ensemble()
-    X_test, y_test = ensemble.train_all_corrected(df, ticker, causal_features)
+    X_test, y_test = ensemble.train_all(df, ticker, causal_features)
     logger.info(f"All models trained in {elapsed(start)}")
 
     test_df = pd.concat([X_test, y_test], axis=1)
@@ -342,7 +342,7 @@ def step5_sample_prediction(
         print(f"  Range (90% CI):   ${result.lower_band:.2f} — ${result.upper_band:.2f}")
         print(f"  Horizon:          {result.horizon_days} trading days")
         print(f"  Model:            {result.model_name}")
-        print(f"\n  Causal Drivers:")
+        print(f"\n  PCMCI-selected Drivers:")
         for d in result.causal_drivers:
             shap  = d.get("shap", d["value"])
             arrow = "▲" if d["impact"] == "positive" else "▼"
@@ -352,7 +352,7 @@ def step5_sample_prediction(
         print(f"{'='*W}")
         print(f"  Live prediction not available for NIFTY index.")
         print(f"  Real-time P/E, P/B and news headlines not available.")
-    print(f"\n  Causal Features Used ({len(causal_features)}):")
+    print(f"\n  PCMCI-selected Features Used ({len(causal_features)}):")
     print(f"    {', '.join(causal_features)}")
     if model_metrics:
         regimes_order = (["overall"] if "overall" in model_metrics else []) +                         [r for r in model_metrics if r != "overall"]
@@ -406,15 +406,32 @@ def step6_regime_backtest(
         import pandas as pd
         pivot = results[metric].unstack(level="regime")
         print(f"\n  {metric.upper().replace('_', ' ')}:")
-        print(f"  {'Model':<20}" + "".join(f"  {c[:12]:>12}" for c in pivot.columns))
-        print(f"  {'-'*20}" + "".join(f"  {'-'*12}" for _ in pivot.columns))
-        for model_name, row in pivot.iterrows():
-            print(f"  {model_name:<20}" + "".join(
-                f"  {v:>12.4f}" if not pd.isna(v) else f"  {'N/A':>12}"
-                for v in row
-            ))
+        print(f"  {'Model':<20}" + "".join(f"  {c[:12]:>20}" for c in pivot.columns))
+        print(f"  {'-'*20}" + "".join(f"  {'-'*20}" for _ in pivot.columns))
+        # If metric is directional_accuracy and CI columns exist, show them
+        show_ci = metric == "directional_accuracy" and "directional_accuracy_ci_lower" in results.columns
+        pivot_lo = results["directional_accuracy_ci_lower"].unstack(level="regime") if show_ci else None
+        pivot_hi = results["directional_accuracy_ci_upper"].unstack(level="regime") if show_ci else None
 
-    print(f"\n  Key finding: causal model degrades less than all_features under regime shifts")
+        for model_name, row in pivot.iterrows():
+            cells = []
+            for c in pivot.columns:
+                v = row[c]
+                if pd.isna(v):
+                    cells.append(f"  {'N/A':>20}")
+                else:
+                    if show_ci:
+                        try:
+                            lo = pivot_lo.loc[model_name, c]
+                            hi = pivot_hi.loc[model_name, c]
+                            cells.append(f"  {v:20.4f} [{lo:.2%},{hi:.2%}]")
+                        except Exception:
+                            cells.append(f"  {v:20.4f}")
+                    else:
+                        cells.append(f"  {v:20.4f}")
+            print(f"  {model_name:<20}" + "".join(cells))
+
+    print(f"\n  Key finding: PCMCI-selected model degrades less than all_features under regime shifts")
     print(f"  Random baseline DA ≈ 0.50 across all regimes")
     print(f"{'='*W}")
 
@@ -456,6 +473,8 @@ Examples:
                         help="Also run walk-forward retraining (~1hr)")
     parser.add_argument("--with-regime",  action="store_true",
                         help="Also train regime-aware models (~40min)")
+    parser.add_argument("--finbert", action="store_true",
+                        help="Use FinBERT for sentiment scoring (slow on CPU, requires GPU ideally)")
     args   = parser.parse_args()
 
     # Normalise ticker
@@ -500,7 +519,7 @@ Examples:
     print(f"\n  Status:")
     print(f"    Data:            {'✓ exists' if skip_data   else '✗ missing'} {'(skipping)' if skip_data   else '(will load)'}")
     print(f"    Feature matrix:  {'✓ exists' if skip_feat   else '✗ missing'} {'(skipping)' if skip_feat   else '(will build)'}")
-    print(f"    Causal features: {'✓ exists' if skip_causal else '✗ missing'} {'(skipping)' if skip_causal else '(will run PCMCI)'}")
+    print(f"    PCMCI-selected features: {'✓ exists' if skip_causal else '✗ missing'} {'(skipping)' if skip_causal else '(will run PCMCI)'}")
     print(f"    Trained models:  {'✓ exists' if skip_train  else '✗ missing'} {'(skipping)' if skip_train  else '(will train)'}")
 
     # Always print configured regime definitions and stats (if feature matrix available)
@@ -511,7 +530,7 @@ Examples:
         step1_load_data(ticker, skip=skip_data, market=args.market)
 
         # Step 2
-        step2_build_features(ticker, force=not skip_feat, market=args.market)
+        step2_build_features(ticker, force=not skip_feat, market=args.market, use_finbert=args.finbert)
 
         # Step 3
         if skip_causal:

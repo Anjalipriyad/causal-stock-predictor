@@ -97,6 +97,7 @@ class StackingMetaLearner:
         self._model_names   = ["lgbm", "xgb", "arima"]
 
         self._default_weights = default_weights or self.DEFAULT_WEIGHTS
+        self._coef_se = None
 
     # -----------------------------------------------------------------------
     # Training
@@ -158,6 +159,36 @@ class StackingMetaLearner:
         ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
         r2     = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
         logger.info(f"[meta_learner] Validation R² = {r2:.4f}")
+
+        # ------------------------------------------------------------------
+        # Bootstrap standard errors for coefficients (diagnostic)
+        # Useful to report variance of learned weights — if large, the
+        # meta-learner is unstable on small validation sets and fixed
+        # fallback weights may be preferable.
+        try:
+            from sklearn.linear_model import Ridge
+
+            n_samples = X_meta_scaled.shape[0]
+            B = min(200, max(20, max(20, n_samples // 2)))
+            coefs_boot = np.zeros((B, self._n_base_models))
+            rng = np.random.default_rng(42)
+            for b in range(B):
+                idx = rng.integers(0, n_samples, n_samples)
+                Xb = X_meta_scaled[idx]
+                yb = y_true[idx]
+                model_b = Ridge(alpha=self.alpha, fit_intercept=True)
+                model_b.fit(Xb, yb)
+                coefs = model_b.coef_
+                # If LSTM was not present during fit, coefs length matches
+                coefs_boot[b, : len(coefs)] = coefs[: self._n_base_models]
+
+            coef_se = coefs_boot.std(axis=0)
+            self._coef_se = {
+                name: float(se) for name, se in zip(self._model_names, coef_se)
+            }
+            logger.info(f"[meta_learner] Coef SE: {self._coef_se}")
+        except Exception:
+            self._coef_se = None
 
     # -----------------------------------------------------------------------
     # Inference
@@ -254,6 +285,7 @@ class StackingMetaLearner:
             "scaler":        self._scaler,
             "model_names":   self._model_names,
             "n_base_models": self._n_base_models,
+            "coef_se":       self._coef_se,
         }, path)
         logger.info(f"[meta_learner] Saved → {path.name}")
 
@@ -271,11 +303,21 @@ class StackingMetaLearner:
         self._scaler        = data["scaler"]
         self._model_names   = data.get("model_names", ["lgbm", "xgb", "arima"])
         self._n_base_models = data.get("n_base_models", 3)
+        self._coef_se       = data.get("coef_se", None)
         self._is_fitted     = True
         logger.info(
             f"[meta_learner] Loaded from {path.name} "
             f"({self._n_base_models} base models: {self._model_names})"
         )
+
+    def learned_weights_with_se(self) -> dict:
+        """
+        Return learned weights and their bootstrap standard errors (if available).
+        """
+        weights = self.learned_weights()
+        if not self._is_fitted:
+            return {"weights": weights, "se": None}
+        return {"weights": weights, "se": self._coef_se}
 
     # -----------------------------------------------------------------------
     # Diagnostics

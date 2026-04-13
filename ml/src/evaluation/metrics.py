@@ -107,6 +107,40 @@ class Metrics:
         correct = ((y_pred >= 0) == (y_true >= 0)).sum()
         return float(correct / len(y_true))
 
+    def bootstrap_da_ci(
+        self,
+        y_pred: pd.Series,
+        y_true: pd.Series,
+        n_bootstrap: int = 1000,
+        alpha: float = 0.05,
+        random_state: int = 42,
+    ) -> tuple[float, float]:
+        """
+        Compute bootstrap confidence interval for directional accuracy.
+
+        Returns (lower, upper) two-sided (1-alpha) CI.
+        """
+        y_pred, y_true = self._align(y_pred, y_true)
+        n = len(y_true)
+        if n == 0:
+            return 0.0, 0.0
+
+        rng = np.random.default_rng(random_state)
+        das = np.zeros(n_bootstrap, dtype=float)
+        # Work with numpy arrays for speed
+        y_pred_vals = np.asarray(y_pred)
+        y_true_vals = np.asarray(y_true)
+
+        for i in range(n_bootstrap):
+            idx = rng.integers(0, n, n)
+            pred_sample = y_pred_vals[idx]
+            true_sample = y_true_vals[idx]
+            das[i] = float(((pred_sample >= 0) == (true_sample >= 0)).sum() / n)
+
+        lower = float(np.percentile(das, 100 * (alpha / 2)))
+        upper = float(np.percentile(das, 100 * (1 - alpha / 2)))
+        return lower, upper
+
     # -----------------------------------------------------------------------
     # sharpe_ratio — CORRECTED with turnover-aware costs
     # -----------------------------------------------------------------------

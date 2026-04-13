@@ -32,6 +32,7 @@ from typing import Optional
 import pandas as pd
 import numpy as np
 from statsmodels.tsa.stattools import grangercausalitytests
+from statsmodels.stats.multitest import multipletests
 
 from ml.src.data.loader import _load_config
 
@@ -94,11 +95,28 @@ class GrangerCausality:
             result = self._test_feature(df[[target, col]].dropna(), target, col, verbose)
             results[col] = result
 
-        n_causal = sum(1 for r in results.values() if r["causal"])
-        logger.info(
-            f"[granger] Done. {n_causal}/{len(feature_cols)} features "
-            f"Granger-causal at p < {self.significance}."
-        )
+        # Multiple testing correction (Benjamini-Hochberg FDR)
+        try:
+            pvals = [results[col]["min_pval"] for col in feature_cols]
+            reject, pvals_corrected, _, _ = multipletests(pvals, alpha=self.significance, method="fdr_bh")
+            for col, rej, p_corr in zip(feature_cols, reject, pvals_corrected):
+                results[col]["min_pval_corrected"] = float(p_corr)
+                # Update causal flag to reflect FDR-corrected decision
+                results[col]["causal"] = bool(rej)
+
+            n_causal = sum(1 for r in results.values() if r["causal"])
+            logger.info(
+                f"[granger] Done. {n_causal}/{len(feature_cols)} features "
+                f"Granger-causal after FDR-BH correction (alpha={self.significance})."
+            )
+        except Exception:
+            # If correction fails for any reason, fall back to uncorrected counts
+            n_causal = sum(1 for r in results.values() if r["causal"])
+            logger.info(
+                f"[granger] Done. {n_causal}/{len(feature_cols)} features "
+                f"Granger-causal at p < {self.significance} (no FDR correction applied)."
+            )
+
         return results
 
     def get_causal_features(self, results: dict[str, dict]) -> list[str]:

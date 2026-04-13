@@ -248,9 +248,20 @@ class Backtester:
                         scores = self.metrics.compute_all(
                             preds["predicted_return"],
                             preds["actual_return"],
-                            label=f"pcmci_causal/{regime_name}",
+                            label=f"pcmci_selected/{regime_name}",
                         )
-                        scores["model"] = "pcmci_causal"
+                        # Bootstrap CI for directional accuracy
+                        try:
+                            lo, hi = self.metrics.bootstrap_da_ci(
+                                preds["predicted_return"], preds["actual_return"]
+                            )
+                            scores["directional_accuracy_ci_lower"] = lo
+                            scores["directional_accuracy_ci_upper"] = hi
+                        except Exception:
+                            scores["directional_accuracy_ci_lower"] = float("nan")
+                            scores["directional_accuracy_ci_upper"] = float("nan")
+
+                        scores["model"] = "pcmci_selected"
                         scores["regime"] = regime_name
                         scores["n_test"] = len(regime_df)
                         results.append(scores)
@@ -271,10 +282,72 @@ class Backtester:
                         preds_all["actual_return"],
                         label=f"all_features/{regime_name}",
                     )
+                    try:
+                        lo, hi = self.metrics.bootstrap_da_ci(
+                            preds_all["predicted_return"], preds_all["actual_return"]
+                        )
+                        scores_all["directional_accuracy_ci_lower"] = lo
+                        scores_all["directional_accuracy_ci_upper"] = hi
+                    except Exception:
+                        scores_all["directional_accuracy_ci_lower"] = float("nan")
+                        scores_all["directional_accuracy_ci_upper"] = float("nan")
+
                     scores_all["model"] = "all_features"
                     scores_all["regime"] = regime_name
                     scores_all["n_test"] = len(regime_df)
                     results.append(scores_all)
+
+                # ------------------ Momentum / Mean-reversion / Buy-and-hold baselines
+                try:
+                    # y_true for this regime
+                    if self.target_col not in regime_df.columns:
+                        raise KeyError("target missing")
+                    y_true = regime_df[self.target_col].dropna()
+                    if len(y_true) >= self.min_test_samples:
+                        # Momentum baseline: use 'momentum_5d' if present, else prior return
+                        if "momentum_5d" in regime_df.columns:
+                            sig = regime_df.loc[y_true.index, "momentum_5d"].fillna(0.0)
+                            y_pred_mom = pd.Series(
+                                np.where(sig >= 0, 0.01, -0.01), index=y_true.index
+                            )
+                        else:
+                            prev = regime_df.loc[y_true.index, self.target_col].shift(1).fillna(0.0)
+                            y_pred_mom = pd.Series(np.where(prev >= 0, 0.01, -0.01), index=y_true.index)
+
+                        mom_scores = self.metrics.compute_all(y_pred_mom, y_true, label=f"momentum/{regime_name}")
+                        lo, hi = self.metrics.bootstrap_da_ci(y_pred_mom, y_true)
+                        mom_scores["directional_accuracy_ci_lower"] = lo
+                        mom_scores["directional_accuracy_ci_upper"] = hi
+                        mom_scores["model"] = "momentum"
+                        mom_scores["regime"] = regime_name
+                        mom_scores["n_test"] = len(y_true)
+                        results.append(mom_scores)
+
+                        # Mean-reversion: opposite of momentum
+                        y_pred_mr = -1 * y_pred_mom
+                        mr_scores = self.metrics.compute_all(y_pred_mr, y_true, label=f"mean_reversion/{regime_name}")
+                        lo, hi = self.metrics.bootstrap_da_ci(y_pred_mr, y_true)
+                        mr_scores["directional_accuracy_ci_lower"] = lo
+                        mr_scores["directional_accuracy_ci_upper"] = hi
+                        mr_scores["model"] = "mean_reversion"
+                        mr_scores["regime"] = regime_name
+                        mr_scores["n_test"] = len(y_true)
+                        results.append(mr_scores)
+
+                        # Buy-and-hold baseline: always predict UP
+                        y_pred_bh = pd.Series(0.01, index=y_true.index)
+                        bh_scores = self.metrics.compute_all(y_pred_bh, y_true, label=f"buy_and_hold/{regime_name}")
+                        lo, hi = self.metrics.bootstrap_da_ci(y_pred_bh, y_true)
+                        bh_scores["directional_accuracy_ci_lower"] = lo
+                        bh_scores["directional_accuracy_ci_upper"] = hi
+                        bh_scores["model"] = "buy_and_hold"
+                        bh_scores["regime"] = regime_name
+                        bh_scores["n_test"] = len(y_true)
+                        results.append(bh_scores)
+
+                except Exception:
+                    # If any baseline fails for this regime, continue gracefully
+                    pass
 
             except Exception as e:
                 logger.warning(f"[backtester] all_features/{regime_name} failed: {e}")

@@ -1,16 +1,17 @@
 # causal-stock-predictor
 
-> **Causal Feature Selection for Robust Equity Return Prediction Under Market Regime Shifts**
 
-A full-stack stock prediction system built around a novel causal ML approach — using PCMCI causal discovery to identify *what actually causes* price movement, not just what correlates with it. Designed for both a research paper and a production web app.
+> **PCMCI-based Feature Selection for Robust Equity Return Prediction Under Market Regime Shifts**
+
+A full-stack stock prediction system built around a reproducible PCMCI-based pipeline — using PCMCI causal-discovery tooling to identify PCMCI-selected features (conditionally independent predictors) rather than relying solely on correlation. Designed for both a research paper and a production web app.
 
 ---
 
 ## What It Does
 
 Given a stock ticker (e.g. `AAPL`), the system:
-1. Identifies which macro + sentiment features **causally drive** its returns using PCMCI
-2. Trains a LightGBM + XGBoost + ARIMA ensemble **only on causal features**
+1. Identifies which macro + sentiment features are selected by PCMCI (conditionally independent predictors)
+2. Trains a LightGBM + XGBoost + ARIMA ensemble **only on PCMCI-selected features**
 3. Predicts **5-day forward log return** with a confidence band
 4. Explains **why** it made the prediction (causal drivers)
 5. Shows robustness across market regimes (bull, crash, recovery, rate hike, AI bull)
@@ -62,6 +63,8 @@ Saved to `ml/data/raw/`. Run once — never again unless you add a new ticker.
 python -m src.features.pipeline --ticker AAPL
 ```
 Saved to `ml/data/processed/features/AAPL_features.csv`
+
+FinBERT ablation: FinBERT-based sentiment scoring is supported for headline-based features. Enable it when building features (slow on CPU) with the `--finbert` flag, e.g. `python -m ml.src.data.nifty_loader --finbert` or via the pipeline `--finbert` option.
 
 ### 5. Run causal discovery
 ```bash
@@ -124,11 +127,13 @@ PredictionResult
 
 The core novelty is the **two-stage pipeline**:
 
-1. **Causal Discovery** — PCMCI identifies lagged causal links between macro/sentiment features and stock returns. Unlike Granger causality, PCMCI controls for confounders and finds conditional independence, producing a stricter causal graph.
+1. **PCMCI Discovery** — PCMCI identifies lagged conditional-independence links (PCMCI-selected features) between macro/sentiment features and stock returns. Unlike simple pairwise correlation, PCMCI controls for confounders and provides a stricter statistical filter; this is *not* an interventional proof of causality and should be described in the paper as "PCMCI-selected features (conditional independence)".
    
   Adaptive selection: the code now implements an adaptive feature-selection fallback. By default the pipeline uses a strict `intersection` of Granger + PCMCI findings; if too few features are selected the selector will iteratively relax Granger/PCMCI p-value thresholds, then fall back to `union`, and finally pick top features by PCMCI p-value if needed. Selection metadata is recorded in `saved_models/causal_features_{TICKER}.json` for transparency.
 
-2. **Regime Robustness** — Models trained on causal features degrade *less* under regime shifts than models trained on all correlated features. This is the central claim of the paper.
+2. **Regime Robustness** — Models trained on PCMCI-selected features may degrade less under regime shifts than models trained on all correlated features. The repository includes code to compute bootstrap confidence intervals for directional accuracy to test whether observed differences are statistically significant.
+
+Note: ticker selection in this repository (large-cap, surviving names) can introduce survivorship bias. For paper submission include a short robustness check with de-listed or underperforming tickers or clearly document this limitation.
 
 ### Evaluation Regimes
 | Regime | Period |

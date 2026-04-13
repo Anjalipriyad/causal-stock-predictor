@@ -393,9 +393,43 @@ class NiftyLoader:
         sent_df = self.load_sentiment(use_finbert=use_finbert)
         sent_df.index = pd.to_datetime(sent_df.index)
         # ffill limit=5 bridges weekends and short gaps (including the ~4-day
-        # mini gaps in the data). The 124-day demonetisation gap exceeds this
-        # limit and correctly becomes zeros — consistent with price data absence.
-        sent_df = sent_df.reindex(tech_df.index).ffill(limit=5).fillna(0.0)
+        # mini gaps in the data). For extremely long headline gaps (e.g.
+        # demonetisation Nov 2016–Feb 2017) we DROP those dates from the
+        # feature matrix rather than zero-fill misleadingly. This avoids
+        # introducing a spurious "zero sentiment" signal during a major
+        # market shock. We consider gaps > 30 consecutive days as long.
+        sent_df = sent_df.reindex(tech_df.index).ffill(limit=5)
+
+        # Identify long missing stretches (article_count == 0) and drop them
+        missing = sent_df["article_count"].fillna(0.0) == 0
+        to_drop = []
+        mask = missing.values
+        idxs = sent_df.index
+        i = 0
+        while i < len(mask):
+            if mask[i]:
+                j = i
+                while j < len(mask) and mask[j]:
+                    j += 1
+                run_len = j - i
+                if run_len > 30:
+                    to_drop.extend(idxs[i:j].tolist())
+                i = j
+            else:
+                i += 1
+
+        if to_drop:
+            logger.info(
+                f"[nifty_loader] Dropping {len(to_drop)} rows due to long headline gaps (>30d)"
+            )
+            # Drop these dates from the technical and fundamental frames so the
+            # final feature matrix does not include the demonetisation gap.
+            tech_df = tech_df.drop(index=to_drop, errors="ignore")
+            fund_df = fund_df.drop(index=to_drop, errors="ignore")
+            sent_df = sent_df.drop(index=to_drop, errors="ignore")
+
+        # Fill remaining small gaps with conservative zeros after removal
+        sent_df = sent_df.fillna(0.0)
 
         # 5. Merge
         df = tech_df.copy()
