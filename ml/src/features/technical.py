@@ -40,6 +40,7 @@ from ml.src.data.loader import _load_config
 logger = logging.getLogger(__name__)
 
 
+
 class TechnicalFeatures:
     """
     Computes all technical features from a raw OHLCV DataFrame.
@@ -47,6 +48,21 @@ class TechnicalFeatures:
             and a DatetimeIndex.
     Output: DataFrame with original OHLCV + all technical features.
     """
+
+    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        [DEPRECATED] Use compute_features() instead.
+        This method is kept for backward compatibility and will be removed in a future release.
+        Calls compute_features(df).
+        """
+        import warnings
+        warnings.warn(
+            "TechnicalFeatures.compute() is deprecated. Use compute_features() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        logger.warning("[technical] WARNING: compute() is deprecated. Use compute_features() instead.")
+        return self.compute_features(df)
 
     def __init__(self, config_path: Optional[str] = None):
         cfg  = _load_config(config_path)
@@ -67,16 +83,14 @@ class TechnicalFeatures:
     # Public
     # -----------------------------------------------------------------------
 
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    def compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Run all technical feature computations on an OHLCV DataFrame.
-        Returns a new DataFrame — original is not modified.
+        Compute and return ONLY safe features (no leaky target columns).
+        This is the ONLY method to use for model training/inference.
         """
         df = df.copy()
         df = df.sort_index()
-
         logger.info("[technical] Computing technical features ...")
-
         df = self._log_returns(df)
         df = self._momentum(df)
         df = self._volatility(df)
@@ -84,11 +98,49 @@ class TechnicalFeatures:
         df = self._macd(df)
         df = self._bollinger(df)
         df = self._atr(df)
-        df = self._target(df)
-
         n_before = len(df)
         df = df.dropna()
-        n_after  = len(df)
+        n_after = len(df)
+        logger.info(
+            f"[technical] Done. {n_after} rows after dropna "
+            f"({n_before - n_after} dropped for warmup)."
+        )
+        # Drop any leaky columns if present (defensive)
+        df = self.drop_leaky_columns(df)
+        return df
+
+    def compute_targets(self, df: pd.DataFrame, spy_close: pd.Series = None) -> pd.DataFrame:
+        """
+        Compute and return ONLY target columns (excess_return_5d, log_return_5d).
+        Use ONLY for label construction, never as features.
+        """
+        df = df.copy()
+        df = df.sort_index()
+        df = self._target(df, spy_close=spy_close)
+        # Only keep target columns and index
+        targets = [c for c in ["excess_return_5d", "log_return_5d"] if c in df.columns]
+        return df[targets]
+
+    def compute_all(self, df: pd.DataFrame, spy_close: pd.Series = None) -> pd.DataFrame:
+        """
+        Compute all features AND target columns. 
+        WARNING: This method returns leaky columns and MUST NOT be used for model training or inference.
+        Use only for exploratory analysis or label construction.
+        """
+        df = df.copy()
+        df = df.sort_index()
+        logger.info("[technical] Computing technical features + targets (unsafe for modeling)...")
+        df = self._log_returns(df)
+        df = self._momentum(df)
+        df = self._volatility(df)
+        df = self._rsi(df)
+        df = self._macd(df)
+        df = self._bollinger(df)
+        df = self._atr(df)
+        df = self._target(df, spy_close=spy_close)
+        n_before = len(df)
+        df = df.dropna()
+        n_after = len(df)
         logger.info(
             f"[technical] Done. {n_after} rows after dropna "
             f"({n_before - n_after} dropped for warmup)."
@@ -280,27 +332,3 @@ class TechnicalFeatures:
     def set_spy_close(self, spy_close: pd.Series) -> None:
         """Set SPY close prices for excess return calculation."""
         self._spy_close = spy_close
-
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Override to pass spy_close to _target
-        df = df.copy()
-        df = df.sort_index()
-        df = self._log_returns(df)
-        df = self._momentum(df)
-        df = self._volatility(df)
-        df = self._rsi(df)
-        df = self._macd(df)
-        df = self._bollinger(df)
-        df = self._atr(df)
-        spy_close = getattr(self, "_spy_close", None)
-        df = self._target(df, spy_close=spy_close)
-        n_before = len(df)
-        df = df.dropna(subset=[c for c in df.columns if c != "excess_return_5d"])
-        df = df.dropna()
-        n_after = len(df)
-        import logging
-        logging.getLogger(__name__).info(
-            f"[technical] Done. {n_after} rows after dropna "
-            f"({n_before - n_after} dropped for warmup)."
-        )
-        return df

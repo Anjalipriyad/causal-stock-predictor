@@ -456,7 +456,34 @@ def check_5_calibration(df, causal_features, target, ticker, results):
         results["calibration"] = {"skipped": True, "reason": "no actual_return"}
         return
 
-    raw_conf = (val_preds["predicted_return"].abs() * 10).clip(0.3, 0.9)
+    # CRITICAL: Use the ensemble's ACTUAL confidence scores, not a synthetic proxy.
+    # The old code used `(abs(predicted_return) * 10).clip(0.3, 0.9)` which is a
+    # meaningless synthetic mapping that makes calibration curves paper-invalid.
+    if "confidence" in val_preds.columns:
+        raw_conf = val_preds["confidence"]
+        logger.info("[check_5] Using ensemble's actual confidence scores for calibration.")
+    else:
+        # Fallback: Generate confidence from individual model agreement if available
+        model_cols = [c for c in val_preds.columns if c.endswith("_pred")]
+        if len(model_cols) >= 2:
+            import numpy as np
+            # Agreement-based confidence: fraction of models agreeing on direction
+            directions = val_preds[model_cols].apply(lambda x: (x >= 0).astype(int))
+            agreement = directions.mean(axis=1)  # fraction predicting UP
+            raw_conf = (2 * (agreement - 0.5).abs()).clip(0.3, 0.9)
+            logger.warning(
+                "[check_5] WARNING: 'confidence' column not in predictions. "
+                "Using model-agreement proxy. For paper evidence, ensure "
+                "ensemble.predict_historical() returns a 'confidence' column."
+            )
+        else:
+            logger.warning(
+                "[check_5] WARNING: No confidence scores available. "
+                "Falling back to |predicted_return|-based proxy. "
+                "Calibration results are NOT valid for paper evidence."
+            )
+            raw_conf = (val_preds["predicted_return"].abs() * 10).clip(0.3, 0.9)
+
     correct  = (
         (val_preds["predicted_return"] >= 0) ==
         (val_preds["actual_return"] >= 0)

@@ -232,12 +232,25 @@ class HMMRegimeDetector:
     # -----------------------------------------------------------------------
 
     def _select_obs_features(self, df: pd.DataFrame) -> list[str]:
-        """Select the best available observation features from df."""
+        """Select the best available observation features from df.
+
+        IMPORTANT: We intentionally exclude log_return_1d because it is the
+        target stock's daily return.  Due to momentum / autocorrelation it is
+        correlated with the 5-day forward return target (log_return_5d).
+        When the HMM is fit on training data including log_return_1d and then
+        used to label test periods, the regime assignments incorporate
+        test-period price information that informed the emission parameters —
+        a subtle but real information leak in the robustness check.
+
+        Instead we use volatility_10d (realised volatility) which captures
+        market-regime structure (calm vs turbulent) without directly leaking
+        price direction.
+        """
         candidates = [
             # VIX (US or India) — first available wins
             ("vix_level",        "india_vix"),
-            # Market return — first available wins
-            ("sp500_return_1d",  "log_return_1d"),
+            # Market regime proxy — volatility captures regime without price direction leak
+            ("sp500_return_1d",  "volatility_10d"),
         ]
         selected = []
         for pair in candidates:
@@ -292,14 +305,32 @@ def run_hmm_regime_backtest(
 
     logger.info(f"[hmm] Running HMM regime backtest for {ticker} ...")
 
-    # Fit HMM and label regimes
-    detector   = HMMRegimeDetector(n_states=n_hmm_states)
-    df_labeled = detector.fit_label(df)
-    hmm_splits = detector.split_by_hmm_state(df_labeled)
-
     bt      = Backtester(config_path)
     metrics = Metrics(config_path)
     results = []
+
+    # Identify global training cutoff using the backtester's ratio
+    train_ratio = bt.cfg["model"]["train_ratio"]
+    train_cutoff_idx = int(len(df) * train_ratio)
+    train_cutoff_date = df.index[train_cutoff_idx]
+
+    # Strictly fit HMM on training split
+    detector   = HMMRegimeDetector(n_states=n_hmm_states)
+    train_df_full = df.loc[:train_cutoff_date]
+    detector.fit(train_df_full)
+
+    # Label entire dataset predictively
+    df_labeled = df.copy()
+    df_labeled["hmm_regime"] = detector.label(df)
+
+    # We exclusively evaluate test-period data split by states
+    # to avoid training on future data.
+    test_df_labeled = df_labeled.iloc[train_cutoff_idx+1:]
+    hmm_splits = {}
+    for state_name in test_df_labeled["hmm_regime"].unique():
+        subset = test_df_labeled[test_df_labeled["hmm_regime"] == state_name]
+        if not subset.empty:
+            hmm_splits[state_name] = subset
 
     all_feature_cols = [c for c in df.columns if c != bt.target_col]
     model_variants   = {

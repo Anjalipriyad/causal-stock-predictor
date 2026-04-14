@@ -59,16 +59,17 @@ def augment_features(
             df[name] = df[c].shift(lag)
             new_cols.append(name)
 
-    # Rolling volatility on the target (if present) and on top numeric cols
-    target = None
-    try:
-        from ml.src.data.loader import _load_config
-        cfg = _load_config()
-        target = cfg["model"]["target"] if cfg else None
-    except Exception:
-        target = None
-
-    vol_base = target if target in df.columns else (cols[0] if cols else None)
+    # Rolling volatility — NEVER use the forward-looking target as base.
+    # The target (e.g. log_return_5d) contains shift(-5) future prices.
+    # Rolling std of this across the train/test split boundary leaks
+    # test-set return information into training rows.
+    # Use log_return_1d (backward-looking, safe) as the volatility base.
+    leaky_targets = [c for c in df.columns
+                     if (c.startswith("log_return_") and c != "log_return_1d")
+                     or c.startswith("excess_return_")]
+    vol_base = "log_return_1d" if "log_return_1d" in df.columns else (
+        cols[0] if cols and cols[0] not in leaky_targets else None
+    )
     for w in vol_windows:
         if vol_base is None:
             break

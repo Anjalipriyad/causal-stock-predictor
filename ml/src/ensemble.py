@@ -201,23 +201,23 @@ class Ensemble:
             self.lgbm.prepare_data(df, causal_features)
 
         # ── 2. Scale ─────────────────────────────────────────────────────
-        X_train_s, X_val_s, X_test_s = self.lgbm.scale(X_train, X_val, X_test, ticker)
-        _, _, _ = self.xgb.scale(X_train, X_val, X_test, ticker)
+        X_train_lgbm_s, X_val_lgbm_s, X_test_lgbm_s = self.lgbm.scale(X_train, X_val, X_test, ticker)
+        X_train_xgb_s, X_val_xgb_s, X_test_xgb_s = self.xgb.scale(X_train, X_val, X_test, ticker)
 
         # ── 3. Optional Optuna tuning ───────────────────────────────────
         tuner = HyperparameterTuner()
         if tuner.enabled:
             logger.info("[ensemble] Running Optuna hyperparameter tuning ...")
-            best_lgbm = tuner.tune_lgbm(X_train_s, y_train, X_val_s, y_val, ticker)
-            best_xgb  = tuner.tune_xgb(X_train_s, y_train, X_val_s, y_val, ticker)
+            best_lgbm = tuner.tune_lgbm(X_train_lgbm_s, y_train, X_val_lgbm_s, y_val, ticker)
+            best_xgb  = tuner.tune_xgb(X_train_xgb_s, y_train, X_val_xgb_s, y_val, ticker)
             self.lgbm._params.update(best_lgbm)
             self.xgb._params.update(best_xgb)
 
         # ── 4. Train base models ─────────────────────────────────────────
-        self.lgbm.fit(X_train_s, y_train, X_val_s, y_val)
+        self.lgbm.fit(X_train_lgbm_s, y_train, X_val_lgbm_s, y_val)
         self.lgbm.save(ticker)
 
-        self.xgb.fit(X_train_s, y_train, X_val_s, y_val)
+        self.xgb.fit(X_train_xgb_s, y_train, X_val_xgb_s, y_val)
         self.xgb.save(ticker)
 
         # ARIMA fitted on training data only (not val)
@@ -227,18 +227,18 @@ class Ensemble:
         lstm_val_preds = None
         if self._lstm_enabled and self.lstm is not None:
             try:
-                self.lstm.fit(X_train_s, y_train, X_val_s, y_val)
+                self.lstm.fit(X_train_lgbm_s, y_train, X_val_lgbm_s, y_val)
                 if self.lstm._is_fitted:
                     self.lstm.save(ticker)
-                    lstm_val_preds = self.lstm.predict_raw(X_val_s)
+                    lstm_val_preds = self.lstm.predict_raw(X_val_lgbm_s)
                     logger.info("[ensemble] LSTM trained and saved.")
             except Exception as e:
                 logger.warning(f"[ensemble] LSTM training failed: {e}. Skipping.")
                 self._lstm_enabled = False
 
         # ── 6. Train meta-learner on VALIDATION SET predictions ──────────
-        val_lgbm  = self.lgbm.predict_raw(X_val_s)
-        val_xgb   = self.xgb.predict_raw(X_val_s)
+        val_lgbm  = self.lgbm.predict_raw(X_val_lgbm_s)
+        val_xgb   = self.xgb.predict_raw(X_val_xgb_s)
 
         # Key fix: rolling one-step forecasts from ARIMA on the validation set
         val_arima = self.arima.predict_val_set(y_val)
@@ -292,7 +292,7 @@ class Ensemble:
         except Exception as e:
             logger.warning(f"[ensemble] ARIMA final refit failed: {e}")
 
-        return X_test_s, y_test
+        return X_test_lgbm_s, y_test
     # -----------------------------------------------------------------------
     # Inference — live
     # -----------------------------------------------------------------------

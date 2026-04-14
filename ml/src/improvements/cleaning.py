@@ -63,13 +63,30 @@ def clean_feature_matrix(
         df = df.drop(columns=constant_cols)
     report["dropped_constant"] = constant_cols
 
-    # Fill remaining NaNs conservatively: ffill -> bfill -> median
-    df = df.ffill().bfill()
+    # Temporal safe imputation: forward-fill only (with limit).
+    # Backward fill strictly violates causality by looking into the future.
+    #
+    # CRITICAL: If the matrix still contains forward-looking target columns
+    # (excess_return_5d, log_return_5d), ffill would propagate shift(-5)
+    # future return values into adjacent NaN rows.  We explicitly exclude
+    # target columns from ffill and warn loudly if they are present.
+    from ml.src.data.loader import _load_config
+    _cfg = _load_config()
+    _target_col = _cfg["model"]["target"]
+    leaky_cols = [c for c in df.columns
+                  if (c.startswith("log_return_") and c != "log_return_1d")
+                  or c.startswith("excess_return_")]
+    if leaky_cols:
+        logger.warning(
+            f"[cleaning] Target/leaky columns found in matrix during cleaning: {leaky_cols}. "
+            f"These will NOT be forward-filled to prevent propagating future returns."
+        )
+    safe_cols = [c for c in df.columns if c not in leaky_cols]
+    df[safe_cols] = df[safe_cols].ffill(limit=5)
     for c in df.columns:
         if df[c].isnull().any():
             if pd.api.types.is_numeric_dtype(df[c]):
-                med = df[c].median()
-                df[c] = df[c].fillna(med)
+                df[c] = df[c].fillna(0.0)
             else:
                 df[c] = df[c].fillna("")
 

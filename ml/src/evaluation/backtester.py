@@ -224,12 +224,24 @@ class Backtester:
 
             # ------------------ PCMCI causal variant ------------------
             try:
-                # Granger on full pre-regime training set
+                # CRITICAL: Strip forward-looking target columns before causal discovery.
+                # train_df contains excess_return_5d and log_return_5d which encode
+                # shift(-horizon) future prices. If PCMCI sees these, any feature with
+                # autocorrelation to price will appear causally linked via shared
+                # future information, inflating Table 2 directional accuracy.
+                leaky_cols = [c for c in train_df.columns
+                              if c.startswith("log_return_") and c != "log_return_1d"
+                              or c.startswith("excess_return_")]
+                # Keep only the configured target for Granger (it needs y in the df)
+                cols_to_drop = [c for c in leaky_cols if c != self.target_col]
+                train_df_clean = train_df.drop(columns=cols_to_drop, errors="ignore")
+
+                # Granger on full pre-regime training set (target column kept for Granger)
                 granger = GrangerCausality()
-                granger_results = granger.run(train_df, target=self.target_col, verbose=False)
+                granger_results = granger.run(train_df_clean, target=self.target_col, verbose=False)
 
                 # PCMCI on last 50% of pre-regime training data (consistent with pipeline)
-                df_pcmci = train_df.iloc[-int(len(train_df) * 0.5):]
+                df_pcmci = train_df_clean.iloc[-int(len(train_df_clean) * 0.5):]
                 pcmci = PCMCIDiscovery()
                 pcmci_results = pcmci.run(df_pcmci, target=self.target_col)
 

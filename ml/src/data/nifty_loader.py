@@ -185,7 +185,8 @@ class NiftyLoader:
             df_old.index = pd.to_datetime(df_old.index)
             # Normalize sentiment within this file's distribution only
             s = pd.to_numeric(df_old["Sentiment_Score"], errors="coerce").fillna(0.0)
-            df_old["_sent_norm"] = ((s - s.mean()) / (s.std() + 1e-8)).clip(-3, 3) / 3
+            roll = s.rolling(window=252, min_periods=1)
+            df_old["_sent_norm"] = ((s - roll.mean()) / (roll.std() + 1e-8)).clip(-3, 3) / 3
             frames.append(df_old)
 
         self._check_file(self.final_data_path)
@@ -193,7 +194,8 @@ class NiftyLoader:
         df_new = df_new.set_index("Date").sort_index()
         df_new.index = pd.to_datetime(df_new.index)
         s = pd.to_numeric(df_new["Sentiment_Score"], errors="coerce").fillna(0.0)
-        df_new["_sent_norm"] = ((s - s.mean()) / (s.std() + 1e-8)).clip(-3, 3) / 3
+        roll = s.rolling(window=252, min_periods=1)
+        df_new["_sent_norm"] = ((s - roll.mean()) / (roll.std() + 1e-8)).clip(-3, 3) / 3
         frames.append(df_new)
 
         df = pd.concat(frames).sort_index()
@@ -377,7 +379,8 @@ class NiftyLoader:
         # 2. Technical features
         tech = TechnicalFeatures()
         tech.set_spy_close(None)   # No SPY benchmark for index prediction
-        tech_df = tech.compute(price_df)
+        # Use compute_all to ensure log_return_5d is present for downstream causal discovery
+        tech_df = tech.compute_all(price_df)
         # Drop excess_return_5d — equals log_return_5d when spy_close=None
         if "excess_return_5d" in tech_df.columns:
             tech_df = tech_df.drop(columns=["excess_return_5d"])
@@ -450,7 +453,13 @@ class NiftyLoader:
 # Add:
         from ml.src.features.nifty_feature_guard import apply_nifty_feature_guard_to_pipeline
         df = apply_nifty_feature_guard_to_pipeline(df)
+        
         # 6. Final cleanup
+        # CRITICAL: Drop trailing rows where the forward-looking target is legitimately unavailable 
+        # before any forward-filling to prevent corrupting the target column with stale returns.
+        if "log_return_5d" in df.columns:
+            df = df.dropna(subset=["log_return_5d"])
+            
         df = df.ffill(limit=5).fillna(0.0)
 
         # Drop any perfectly constant columns (no variance = no signal)
@@ -564,14 +573,16 @@ class NiftyLoader:
             df_old = df_old.set_index("Date").sort_index()
             df_old.index = pd.to_datetime(df_old.index)
             s = pd.to_numeric(df_old["Sentiment_Score"], errors="coerce").fillna(0.0)
-            norm = ((s - s.mean()) / (s.std() + 1e-8)).clip(-3, 3) / 3
+            roll = s.rolling(window=252, min_periods=1)
+            norm = ((s - roll.mean()) / (roll.std() + 1e-8)).clip(-3, 3) / 3
             frames.append(norm.rename("_s"))
 
         df_new = pd.read_csv(self.final_data_path, parse_dates=["Date"])
         df_new = df_new.set_index("Date").sort_index()
         df_new.index = pd.to_datetime(df_new.index)
         s = pd.to_numeric(df_new["Sentiment_Score"], errors="coerce").fillna(0.0)
-        norm = ((s - s.mean()) / (s.std() + 1e-8)).clip(-3, 3) / 3
+        roll = s.rolling(window=252, min_periods=1)
+        norm = ((s - roll.mean()) / (roll.std() + 1e-8)).clip(-3, 3) / 3
         frames.append(norm.rename("_s"))
 
         s_norm = pd.concat(frames).sort_index()

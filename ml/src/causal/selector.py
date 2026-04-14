@@ -152,7 +152,7 @@ class CausalSelector:
                         f"[selector] Only {len(fallback)} candidate features available by Granger (min={self.min_causal_features})."
                     )
 
-        if self.strategy == "intersection":
+        elif self.strategy == "intersection":
             # First try strict intersection using boolean causal flags
             sel = table[table["granger_causal"] & table["pcmci_causal"]]
             if len(sel) >= self.min_causal_features and not force_adaptive:
