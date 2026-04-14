@@ -241,9 +241,13 @@ class Backtester:
                     features_pcmci = []
 
                 if features_pcmci:
-                    ensemble = Ensemble(config_path)
-                    ensemble.train_all(train_df, ticker, features_pcmci)
-                    preds = ensemble.predict_historical(regime_df, features_pcmci)
+                    # Use regime-specific ticker name so save() does NOT
+                    # overwrite production model files on disk
+                    regime_ticker = f"{ticker}_{regime_name}_eval"
+                    # Pass a fresh ensemble to avoid leakage/state issues
+                    fresh = Ensemble(config_path=self.config_path)
+                    fresh.train_all(train_df, regime_ticker, features_pcmci)
+                    preds = fresh.predict_historical(regime_df, features_pcmci)
                     if "actual_return" in preds.columns:
                         scores = self.metrics.compute_all(
                             preds["predicted_return"],

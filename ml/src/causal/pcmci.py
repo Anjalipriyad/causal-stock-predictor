@@ -61,6 +61,7 @@ class PCMCIDiscovery:
 
     def __init__(self, config_path: Optional[str] = None):
         cfg   = _load_config(config_path)
+        self.cfg = cfg
         pcmci = cfg["causal"]["pcmci"]
 
         self.tau_min      = pcmci["tau_min"]
@@ -147,6 +148,10 @@ class PCMCIDiscovery:
         # Conditional independence test
         cit = self._get_cit()
 
+        # Seed for reproducibility (tigramite uses np.random internally)
+        seed = self.cfg.get("project", {}).get("random_seed", 42)
+        np.random.seed(seed)
+
         # Run PCMCI
         pcmci_obj = PCMCI(
             dataframe=dataframe,
@@ -158,6 +163,7 @@ class PCMCIDiscovery:
             tau_min=self.tau_min,
             tau_max=self.tau_max,
             pc_alpha=self.pc_alpha,
+            alpha_level=self.alpha_level
         )
 
         # Extract causal links TO the target variable
@@ -263,15 +269,11 @@ class PCMCIDiscovery:
         target_idx: Optional[int],
     ) -> dict[str, dict]:
         """
-        Extract causal-link summaries.
-
-        If `target_idx` is provided, extract links pointing TO that target
-        variable (original behaviour). If `target_idx` is None (we ran
-        PCMCI on a feature-only set to avoid forward-looking target leakage),
-        return for each feature the strongest outgoing link to any other
-        variable (used as a conservative proxy for feature importance).
+        Extract causal parent information from PCMCI results.
+        Uses corrected p-values (q_matrix) if available.
         """
-        p_matrix   = results["p_matrix"]
+        # q_matrix is usually returned when alpha_level is passed
+        p_matrix = results.get("q_matrix", results["p_matrix"])
         val_matrix = results["val_matrix"]
         n_vars     = len(var_names)
 

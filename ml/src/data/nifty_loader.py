@@ -103,6 +103,17 @@ class NiftyLoader:
         Returns:
             DataFrame with DatetimeIndex, columns: open, high, low, close, volume
         """
+        # PAPER DISCLOSURE REQUIRED: True intraday High/Low not available for 2008-2018.
+        # H/L are approximated as open/close ± 0.5%. This compresses ATR and bb_width
+        # for the pre-2019 period. All technical indicators dependent on H/L are
+        # unreliable for 2008-2018. See paper Section 3.1 for robustness analysis.
+        import warnings
+        warnings.warn(
+            "Nifty 2008-2018: High/Low approximated from Open/Close ±0.5%. "
+            "ATR, Bollinger width, and vol features are unreliable for this period. "
+            "Paper must disclose this as a threat to validity.",
+            UserWarning, stacklevel=2
+        )
         frames = []
 
         # ── Unused_Data: 2008-01-28 → 2018-12-27 ─────────────────────────

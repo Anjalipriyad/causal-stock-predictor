@@ -45,6 +45,7 @@ class Metrics:
         cfg     = _load_config(config_path)
         trading = cfg["evaluation"]["trading"]
 
+        self.cfg             = cfg
         self.risk_free_rate  = trading["risk_free_rate_annual"]
         self.trading_days    = trading["trading_days_per_year"]
         self.tx_cost_bps     = trading["transaction_cost_bps"]
@@ -181,19 +182,40 @@ class Metrics:
 
         daily_rf = self.risk_free_rate / self.trading_days
         excess   = strat_rets_net - daily_rf
-        std      = strat_rets_net.std()
 
-        if std == 0 or np.isnan(std):
+        # ── HAC/Newey-West correction for overlapping returns ─────────────
+        # 5-day log returns overlap — return[t] and return[t+1] share 4 of
+        # the same 5 days. This induces autocorrelation that inflates the
+        # standard Sharpe ratio by roughly 2-3x. We use the Newey-West HAC
+        # variance estimator with Bartlett kernel, lags = horizon - 1.
+        n      = len(excess)
+        mean_e = excess.mean()
+        horizon_days = self.cfg.get("model", {}).get("horizon_days", 5)
+        lags   = max(horizon_days - 1, 0)  # 4 for 5-day returns
+
+        excess_vals = np.asarray(excess)
+        gamma0 = np.var(excess_vals, ddof=1)
+        hac_var = gamma0
+        for lag in range(1, lags + 1):
+            weight = 1 - lag / (lags + 1)   # Bartlett kernel
+            gamma_k = np.mean(
+                (excess_vals[lag:] - mean_e) * (excess_vals[:-lag] - mean_e)
+            )
+            hac_var += 2 * weight * gamma_k
+
+        hac_std = np.sqrt(max(hac_var, 1e-12))
+
+        if hac_std == 0 or np.isnan(hac_std):
             return 0.0
 
-        sharpe = float((excess.mean() / std) * np.sqrt(self.trading_days))
+        sharpe = float((mean_e / hac_std) * np.sqrt(self.trading_days))
 
         # Log turnover stats for transparency
         n_trades   = int(turned_over.sum())
         turnover_pct = n_trades / len(positions) * 100
         logger.debug(
-            f"[metrics] Sharpe={sharpe:.4f}, turnover={n_trades}/{len(positions)} "
-            f"periods ({turnover_pct:.1f}%)"
+            f"[metrics] Sharpe(HAC)={sharpe:.4f}, turnover={n_trades}/{len(positions)} "
+            f"periods ({turnover_pct:.1f}%), HAC_lags={lags}"
         )
         return sharpe
 

@@ -144,7 +144,10 @@ class FeaturePipeline:
         earnings_df = self.earnings.compute(ticker, price_df)
 
         # 4d. Options IV features (historical proxy)
-        options_df = self.options.compute_historical(ticker, price_df)
+        vix_series = None
+        if "^VIX" in macro_dict:
+            vix_series = macro_dict["^VIX"]["close"]
+        options_df = self.options.compute_historical(ticker, price_df, vix_series=vix_series)
 
         # 5. Sentiment features
         if sentiment_df is not None and not sentiment_df.empty:
@@ -237,10 +240,14 @@ class FeaturePipeline:
         # Options IV features (live — uses current options chain)
         options_live = self.options.compute_live(ticker, price_df)
         # Corrected: do NOT broadcast live IV to historical rows
-# Only use live IV for the LAST row (current date)
+        # Only use live IV for the LAST row (current date)
         from ml.src.features.options import OptionsFeatures
         OptionsFeatures.check_no_live_broadcast(options_live, context="pipeline.build_live")
-# Then join only to the single-row live vector, not to the full history if not options_live.empty else None
+        # For historical proxy in live mode if needed:
+        vix_series = None
+        if "^VIX" in macro_dict:
+             vix_series = macro_dict["^VIX"]["close"]
+        options_df = self.options.compute_historical(ticker, price_df, vix_series=vix_series)
 
         # Merge
         df = self._merge(tech_df, macro_df, sent_df, sector_df, earnings_df, options_df)

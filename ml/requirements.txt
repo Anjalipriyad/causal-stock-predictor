@@ -1,4 +1,19 @@
-statsmodels>=0.14.0      # McNemar test, DM test (check if already present)
-hmmlearn>=0.3.0          # HMM regime detection (Check 7)
-scipy>=1.11.0            # Binomial test (check if already present)
-scikit-learn>=1.3.0      # Isotonic regression calibration (check if already present)
+# causal-stock-predictor — Python dependencies
+# Install: pip install -r requirements.txt
+
+yfinance>=0.2.36
+pandas>=2.0.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+lightgbm>=4.3.0
+xgboost>=2.0.0
+pmdarima>=2.0.4
+tigramite>=5.2.0
+statsmodels>=0.14.0
+shap>=0.44.0
+requests>=2.31.0
+pyyaml>=6.0.1
+joblib>=1.3.0
+scipy>=1.12.0
+hmmlearn>=0.3.0
+python-dateutil>=2.8.0

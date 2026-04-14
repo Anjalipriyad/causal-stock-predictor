@@ -96,17 +96,19 @@ class OptionsFeatures:
     # -----------------------------------------------------------------------
 
     def compute_historical(
-        self, ticker: str, price_df: pd.DataFrame
+        self, ticker: str, price_df: pd.DataFrame, vix_series: pd.Series = None
     ) -> pd.DataFrame:
         """
         Compute historical IV proxy from realised volatility and VIX.
         Returns full-length DataFrame — safe for all backtesting uses.
-        The sentinel column is NOT added here.
+
+        CRITICAL FIX: vix_series must be passed from the data loader to
+        avoid look-ahead bias. Never download data inside feature compute.
         """
         if not self.enabled:
             return self._empty_historical(price_df.index)
         try:
-            return self._compute_iv_proxy(ticker, price_df)
+            return self._compute_iv_proxy(ticker, price_df, vix_series)
         except Exception as e:
             logger.warning(f"[options] Historical IV computation failed: {e}")
             return self._empty_historical(price_df.index)
@@ -219,21 +221,15 @@ class OptionsFeatures:
     # Private — historical IV proxy (same as original)
     # -----------------------------------------------------------------------
 
-    def _compute_iv_proxy(self, ticker: str, price_df: pd.DataFrame) -> pd.DataFrame:
+    def _compute_iv_proxy(self, ticker: str, price_df: pd.DataFrame, vix_series: pd.Series = None) -> pd.DataFrame:
         """Historical IV proxy using VIX-beta approach."""
-        import yfinance as yf
         result = pd.DataFrame(index=price_df.index)
 
-        try:
-            vix = yf.download(
-                "^VIX",
-                start=str(price_df.index.min().date()),
-                end=str(price_df.index.max().date()),
-                progress=False,
-                auto_adjust=True,
-                multi_level_index=False,
-            )["close"].reindex(price_df.index).ffill()
-        except Exception:
+        if vix_series is not None:
+            vix = vix_series.reindex(price_df.index).ffill()
+        else:
+            # Fallback: if VIX not provided, warn and return zeros for proxy-linked cols
+            logger.warning(f"[options] No VIX series provided for {ticker} IV proxy")
             return self._empty_historical(price_df.index)
 
         log_ret = np.log(price_df["close"] / price_df["close"].shift(1))

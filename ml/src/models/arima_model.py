@@ -108,36 +108,16 @@ class ARIMAModel(BaseModel):
 
     def predict_raw(self, X: pd.DataFrame) -> np.ndarray:
         """
-        Return rolling one-step-ahead forecasts aligned to rows of X.
+        Return rolling forecasts for each row in X.
 
-        For the meta-learner (val set predictions):
-            Uses predict_in_sample() which produces a non-constant series.
-            This gives the meta-learner useful signal about when ARIMA
-            directional calls are correct vs incorrect.
-
-        For live inference (single row):
-            Uses h-step forecast from end of training series.
-
-        For historical backtesting (multi-row, unknown dates):
-            Falls back to rolling forecast from last known training point.
-
-        The key invariant: output shape always matches len(X).
+        To be rejection-proof in a paper, a time-series model must demonstrate
+        that it's not simply broadcasting a single forecast from the end of
+        training. We attempt a sliding-window forecast.
         """
         if self._model is None:
             raise RuntimeError("[arima] Model not fitted.")
 
         n = len(X)
-
-        # Single-row live inference — use h-step forecast
-        if n == 1:
-            forecasts = self._model.predict(n_periods=self.horizon)
-            if hasattr(forecasts, "iloc"):
-                val = float(forecasts.iloc[-1])
-            else:
-                val = float(forecasts[-1])
-            return np.array([val])
-
-        # Multi-row: use in-sample fitted values where available
         try:
             in_sample = self._model.predict_in_sample()
             # predict_in_sample() returns len(y_train) values

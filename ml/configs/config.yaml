@@ -141,7 +141,7 @@ causal:
   granger:
     max_lag: 5
     significance: 0.05
-    test: "ssr_chi2test"
+    test: "params_ftest"            # F-test: valid for finite samples (chi2 is asymptotic only)
 
   pcmci:
     tau_min: 1

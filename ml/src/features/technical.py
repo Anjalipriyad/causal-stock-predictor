@@ -235,6 +235,11 @@ class TechnicalFeatures:
 
         Removing market-wide moves isolates stock-specific signal.
         Falls back to raw log return if SPY data not available.
+
+        WARNING — BOTH excess_return_5d AND log_return_5d contain
+        future prices via shift(-horizon). They are target columns
+        and must NEVER be included as features during causal discovery
+        or model training. Use drop_leaky_columns() to strip them.
         """
         stock_ret = np.log(df["close"].shift(-self.horizon) / df["close"])
 
@@ -247,9 +252,30 @@ class TechnicalFeatures:
             # Fallback to raw return if SPY not available
             df["excess_return_5d"] = stock_ret
 
-        # Keep raw return as a feature too
+        # Keep raw return as auxiliary target column (NOT a feature)
         df["log_return_5d"] = stock_ret
         return df
+
+    @staticmethod
+    def drop_leaky_columns(df: pd.DataFrame, keep_target: str = None) -> pd.DataFrame:
+        """
+        Remove forward-looking target columns from a DataFrame.
+
+        Both excess_return_5d and log_return_5d contain future prices
+        (shift(-horizon)) and must be stripped before causal discovery
+        or any analysis that should not see the future.
+
+        Args:
+            df:          DataFrame to clean
+            keep_target: If set, keep this one column (e.g. for Granger
+                         which needs the target column in the DataFrame)
+
+        Returns:
+            DataFrame with leaky columns removed
+        """
+        leaky = ["excess_return_5d", "log_return_5d"]
+        to_drop = [c for c in leaky if c in df.columns and c != keep_target]
+        return df.drop(columns=to_drop)
 
     def set_spy_close(self, spy_close: pd.Series) -> None:
         """Set SPY close prices for excess return calculation."""

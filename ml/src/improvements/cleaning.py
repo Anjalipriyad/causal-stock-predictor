@@ -64,7 +64,7 @@ def clean_feature_matrix(
     report["dropped_constant"] = constant_cols
 
     # Fill remaining NaNs conservatively: ffill -> bfill -> median
-    df = df.fillna(method="ffill").fillna(method="bfill")
+    df = df.ffill().bfill()
     for c in df.columns:
         if df[c].isnull().any():
             if pd.api.types.is_numeric_dtype(df[c]):
