@@ -376,10 +376,29 @@ class Ensemble:
         else:
             # Fallback: original volatility-based bands and blended confidences
             conf_lgbm = self.lgbm._compute_confidence(np.array([pred_lgbm]),  X_lgbm)
-            conf_xgb  = self.xgb._compute_confidence( np.array([pred_xgb]),   X_xgb)
-            # Weight confidence by meta-learner's learned emphasis
-            w         = self.cfg["model"]["ensemble"]["weights"]
-            confidence = w["lgbm"] * conf_lgbm + w["xgb"] * conf_xgb + w["arima"] * 0.5
+            conf_xgb  = self.xgb._compute_confidence(np.array([pred_xgb]),   X_xgb)
+            # Prefer meta-learner's learned emphasis for confidence weighting
+            try:
+                if getattr(self.meta_learner, "_is_fitted", False):
+                    learned = self.meta_learner.learned_weights()
+                    # Convert to non-negative importance and normalise
+                    pos = {k: max(0.0, float(learned.get(k, 0.0))) for k in ["lgbm", "xgb", "arima"]}
+                    total = sum(pos.values())
+                    if total > 0:
+                        norm = {k: pos[k] / total for k in pos}
+                    else:
+                        norm = self.cfg["model"]["ensemble"]["weights"]
+                else:
+                    norm = self.cfg["model"]["ensemble"]["weights"]
+            except Exception:
+                norm = self.cfg["model"]["ensemble"]["weights"]
+
+            arima_w = norm.get("arima", 0.15)
+            confidence = (
+                norm.get("lgbm", 0.0) * conf_lgbm
+                + norm.get("xgb", 0.0) * conf_xgb
+                + arima_w * 0.5
+            )
             confidence = float(np.clip(confidence, 0.3, 0.9))
 
             # Confidence band — volatility based

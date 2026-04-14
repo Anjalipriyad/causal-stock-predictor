@@ -330,8 +330,16 @@ class FeaturePipeline:
         live=True  (inference): NEVER drop columns — fill NaN with 0 instead
                                 so live feature vector always matches training columns
         """
-        # Always drop leakage columns
-        df = df.drop(columns=["log_return_5d"], errors="ignore")
+        # Always remove forward-looking return columns except the configured target
+        # This prevents leakage where a different return column remains as a feature
+        # while the configured target is later dropped.
+        return_cols = [
+            c for c in df.columns
+            if c.startswith("log_return_") or c.startswith("excess_return_")
+        ]
+        for c in return_cols:
+            if c != self.target_col:
+                df = df.drop(columns=[c], errors="ignore")
 
         if not live:
             # Training mode — drop last N rows (target not available)

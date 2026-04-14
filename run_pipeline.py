@@ -182,7 +182,11 @@ def step3_causal_discovery(ticker: str) -> list[str]:
         f"({df_pcmci.index.min().date()} → {df_pcmci.index.max().date()})"
     )
     pcmci          = PCMCIDiscovery()
-    pcmci_results  = pcmci.run(df_pcmci, target=target)
+    # To avoid including the forward-looking target column inside the PCMCI
+    # variable set (which can bias conditional-independence tests), run
+    # PCMCI on the feature set only and use Granger for direct feature→target
+    # strength. This prevents target-derived leakage inside PCMCI's graph.
+    pcmci_results  = pcmci.run(df_pcmci, target=target, exclude_target=True)
     pcmci_features = pcmci.get_causal_features(pcmci_results)
     logger.info(f"PCMCI done in {elapsed(start)} — {len(pcmci_features)} causal features")
 

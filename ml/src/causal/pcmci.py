@@ -78,6 +78,7 @@ class PCMCIDiscovery:
         self,
         df: pd.DataFrame,
         target: Optional[str] = None,
+        exclude_target: bool = False,
     ) -> dict:
         """
         Run PCMCI on the full feature matrix.
@@ -107,9 +108,19 @@ class PCMCIDiscovery:
                 "Install with: pip install tigramite"
             )
 
-        df     = df.copy().sort_index().dropna()
-        cols   = list(df.columns)
-        target_idx = cols.index(target)
+        df     = df.copy().sort_index()
+        # Note: do NOT dropna() here — tigramite expects aligned series and
+        # users may prefer to dropna earlier. We'll drop rows only when building
+        # the tigramite DataFrame below (safe conversion to float).
+
+        # Optionally run PCMCI on features-only to avoid including the
+        # forward-looking target column directly inside the PCMCI variable set.
+        if exclude_target:
+            cols = [c for c in df.columns if c != target]
+            target_idx = None
+        else:
+            cols = list(df.columns)
+            target_idx = cols.index(target)
 
         logger.info(
             f"[pcmci] Running PCMCI on {len(cols)} variables "
@@ -118,11 +129,19 @@ class PCMCIDiscovery:
         )
 
         # Build tigramite dataframe
-        data     = df.values.astype(float)
+        # Build numeric array for tigramite; if we excluded the target,
+        # use df[cols], otherwise use the full df. Keep the time index
+        # aligned to the rows actually passed to tigramite (after dropna).
+        data_frame_for_pcmci = df[cols].dropna()
+        dropped = len(df) - len(data_frame_for_pcmci)
+        if dropped > 0:
+            logger.info(f"[pcmci] Dropped {dropped} rows with NaNs before PCMCI (remaining={len(data_frame_for_pcmci)})")
+        data = data_frame_for_pcmci.values.astype(float)
+        # datatime must match the number of rows in `data_frame_for_pcmci`.
         dataframe = pp.DataFrame(
             data,
             var_names=cols,
-            datatime=np.arange(len(df)),
+            datatime=np.arange(len(data_frame_for_pcmci)),
         )
 
         # Conditional independence test
@@ -142,6 +161,12 @@ class PCMCIDiscovery:
         )
 
         # Extract causal links TO the target variable
+        # If we excluded the target from the PCMCI run, construct an
+        # alternative "causal_links" mapping based on outgoing links from
+        # each feature to the rest of the feature set (minimal p-value
+        # across outgoing edges). This avoids inserting the forward-looking
+        # target into the variable set while still producing a usable
+        # pcmci_results structure for the selector.
         causal_links = self._extract_links(
             results, cols, target_idx
         )
@@ -235,41 +260,71 @@ class PCMCIDiscovery:
         self,
         results: dict,
         var_names: list[str],
-        target_idx: int,
+        target_idx: Optional[int],
     ) -> dict[str, dict]:
         """
-        Extract all causal links pointing TO the target variable.
+        Extract causal-link summaries.
 
-        p_matrix shape:   (n_vars, n_vars, tau_max - tau_min + 1)
-        val_matrix shape: same
-
-        p_matrix[i, j, tau] = p-value for link X_i(t-tau) → X_j(t)
-        We want all i where j = target_idx.
+        If `target_idx` is provided, extract links pointing TO that target
+        variable (original behaviour). If `target_idx` is None (we ran
+        PCMCI on a feature-only set to avoid forward-looking target leakage),
+        return for each feature the strongest outgoing link to any other
+        variable (used as a conservative proxy for feature importance).
         """
         p_matrix   = results["p_matrix"]
         val_matrix = results["val_matrix"]
         n_vars     = len(var_names)
 
         causal_links = {}
-        for i, name in enumerate(var_names):
-            if i == target_idx:
-                continue   # skip self-link
 
-            # p-values for this variable → target across all lags
-            pvals = p_matrix[i, target_idx, :]
-            vals  = val_matrix[i, target_idx, :]
+        if target_idx is not None:
+            # Original behaviour: extract links TO the target variable only
+            for i, name in enumerate(var_names):
+                if i == target_idx:
+                    continue   # skip self-link
 
-            # Best (minimum) p-value across lags
-            best_tau_idx = int(np.argmin(pvals))
-            best_pval    = float(pvals[best_tau_idx])
-            best_val     = float(vals[best_tau_idx])
-            best_lag     = best_tau_idx + self.tau_min
+                # p-values for this variable → target across all lags
+                pvals = p_matrix[i, target_idx, :]
+                vals  = val_matrix[i, target_idx, :]
 
-            causal_links[name] = {
-                "causal":   best_pval < self.alpha_level,
-                "pval":     best_pval,
-                "val":      best_val,
-                "best_lag": best_lag,
-            }
+                # Best (minimum) p-value across lags
+                best_tau_idx = int(np.nanargmin(pvals))
+                best_pval    = float(pvals[best_tau_idx])
+                best_val     = float(vals[best_tau_idx])
+                best_lag     = best_tau_idx + self.tau_min
+
+                causal_links[name] = {
+                    "causal":   best_pval < self.alpha_level,
+                    "pval":     best_pval,
+                    "val":      best_val,
+                    "best_lag": best_lag,
+                }
+        else:
+            # Excluded target: produce a feature-centric summary based on the
+            # strongest outgoing link from each feature to any other variable.
+            # This provides a conservative proxy for a feature's causal
+            # importance when the explicit target is intentionally omitted
+            # from the PCMCI variable set to avoid forward-looking leakage.
+            tau_range = p_matrix.shape[2]
+            for i, name in enumerate(var_names):
+                # Exclude self-links by setting them to nan
+                pvals_i = np.array(p_matrix[i, :, :], copy=True)
+                pvals_i[i, :] = np.nan
+                # Flatten and find best (treat non-finite as non-significant)
+                pvals_flat = np.nan_to_num(pvals_i, nan=1.0, posinf=1.0, neginf=1.0)
+                best_flat_idx = int(np.argmin(pvals_flat))
+                j_idx, tau_idx = np.unravel_index(best_flat_idx, (n_vars, tau_range))
+                raw_pval = pvals_i[j_idx, tau_idx]
+                best_pval = float(raw_pval) if np.isfinite(raw_pval) else 1.0
+                raw_val = val_matrix[i, j_idx, tau_idx]
+                best_val = float(raw_val) if np.isfinite(raw_val) else 0.0
+                best_lag = int(tau_idx + self.tau_min)
+
+                causal_links[name] = {
+                    "causal":   best_pval < self.alpha_level,
+                    "pval":     best_pval,
+                    "val":      best_val,
+                    "best_lag": best_lag,
+                }
 
         return causal_links

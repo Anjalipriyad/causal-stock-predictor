@@ -171,18 +171,35 @@ class GrangerCausality:
         """
         # Need at least 3 * max_lag rows for reliable test
         min_rows = 3 * self.max_lag
-        if len(df) < min_rows:
+
+        # Work on contiguous non-missing blocks to avoid mixing disjoint
+        # time segments (dropna() would create discontinuities which break
+        # the lag interpretation). Find the longest contiguous block of
+        # non-missing values and run the Granger test there.
+        full = df[[target, feature]].copy()
+        mask = full.notnull().all(axis=1).to_numpy()
+        idxs = np.where(mask)[0]
+        if len(idxs) < min_rows:
             logger.warning(
-                f"[granger] {feature}: too few rows ({len(df)} < {min_rows}), skipping."
+                f"[granger] {feature}: too few non-missing rows ({len(idxs)} < {min_rows}), skipping."
             )
             return {"causal": False, "min_pval": 1.0, "best_lag": -1}
 
-        # Ensure correct column order: [target, feature]
-        data = df[[target, feature]].copy()
+        # Split into contiguous segments of indices
+        splits = np.split(idxs, np.where(np.diff(idxs) != 1)[0] + 1)
+        # Choose the longest segment
+        best_seg = max(splits, key=lambda s: len(s))
+        if len(best_seg) < min_rows:
+            logger.warning(
+                f"[granger] {feature}: longest contiguous block too short ({len(best_seg)} < {min_rows}), skipping."
+            )
+            return {"causal": False, "min_pval": 1.0, "best_lag": -1}
+
+        data_seg = full.iloc[best_seg[0] : best_seg[-1] + 1]
 
         try:
             test_results = grangercausalitytests(
-                data,
+                data_seg,
                 maxlag=self.max_lag,
                 verbose=False,
             )
@@ -190,7 +207,6 @@ class GrangerCausality:
             # Extract minimum p-value across all lags
             pvals = []
             for lag, result in test_results.items():
-                # result[0] is dict of test_name → (test_stat, pval, df, df_denom)
                 pval = result[0][self.test][1]
                 pvals.append((lag, pval))
 

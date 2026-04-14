@@ -119,6 +119,39 @@ class CausalSelector:
         feature_names = []
         selection_info = {"method": self.strategy, "note": "initial"}
 
+        # If PCMCI was run with exclude_target=True, pcmci_results may omit
+        # the target index (target_idx == None). In that case PCMCI produced
+        # a feature-centric outgoing-link summary rather than direct
+        # feature→target p-values. Use Granger-only selection in that mode
+        # to avoid misinterpreting outgoing-link p-values as feature→target.
+        pcmci_target_idx = None
+        try:
+            pcmci_target_idx = pcmci_results.get("target_idx") if pcmci_results is not None else None
+        except Exception:
+            pcmci_target_idx = None
+
+        if pcmci_target_idx is None:
+            # PCMCI excluded the explicit target — pick features by Granger only
+            logger.info(
+                "[selector] PCMCI ran with exclude_target=True; selecting based on Granger p-values only."
+            )
+            granger_sig = float(self.cfg.get("causal", {}).get("granger", {}).get("significance", 0.05))
+            sel = table[table["granger_pval"] <= granger_sig]
+            if len(sel) >= self.min_causal_features and not force_adaptive:
+                feature_names = _features_from_df(sel)
+                selection_info.update({"method": "granger_only", "n": len(feature_names)})
+            else:
+                # Fallback: take top features by Granger p-value
+                fallback = table.sort_values("granger_pval")["feature"].tolist()
+                if len(fallback) >= self.min_causal_features:
+                    feature_names = fallback[: self.min_causal_features]
+                    selection_info.update({"method": "granger_top_n", "n": len(feature_names)})
+                else:
+                    # Not enough features — raise informative error
+                    raise ValueError(
+                        f"[selector] Only {len(fallback)} candidate features available by Granger (min={self.min_causal_features})."
+                    )
+
         if self.strategy == "intersection":
             # First try strict intersection using boolean causal flags
             sel = table[table["granger_causal"] & table["pcmci_causal"]]

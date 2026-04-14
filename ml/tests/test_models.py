@@ -233,9 +233,18 @@ class TestARIMAModel:
         X_tr, _, X_te, y_tr, _, y_te = split_data
         model = ARIMAModel()
         model.fit(X_tr, y_tr)
-        # Provide the actual held-out test targets so predict_raw can update
-        preds = model.predict_raw(X_te, y_true=y_te)
-        assert not np.allclose(preds, preds[0])
+        # Provide the actual held-out test targets so predict_val_set can produce
+        # genuine one-step-ahead rolling forecasts for the validation/test period.
+        preds = model.predict_val_set(y_te)
+        # Basic checks: length matches and values are finite
+        assert len(preds) == len(y_te)
+        assert np.all(np.isfinite(preds))
+        # If the fitted ARIMA is non-trivial (not constant mean ARIMA(0,0,0)),
+        # expect non-constant rolling forecasts. If ARIMA(0,0,0) was selected
+        # by auto-arima, constant predictions are a valid outcome.
+        model_order = getattr(getattr(model, "_model", None), "order", None)
+        if model_order is None or tuple(model_order) != (0, 0, 0):
+            assert not np.allclose(preds, preds[0])
 
     def test_save_and_load(self, tmp_path, split_data):
         X_tr, _, _, y_tr, _, _ = split_data
