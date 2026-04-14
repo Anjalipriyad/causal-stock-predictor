@@ -99,17 +99,23 @@ def run_baseline(ticker: str, market: str = "us", force_retrain: bool = False) -
     splitter = RegimeSplitter()
     regimes = splitter.split_all(df)
     for regime_name, regime_df in regimes.items():
-        if len(regime_df) < 30:
+        # CRITICAL: Only evaluate on out-of-sample regime rows (part of test_df)
+        regime_test = regime_df[regime_df.index >= df.index[test_start]]
+        if len(regime_test) < 30:
+            logger.info(f"[diagnostics] Skipping {regime_name}: <30 out-of-sample test rows.")
             continue
         try:
-            preds_r = ensemble.predict_historical(regime_df, causal_features)
+            preds_r = ensemble.predict_historical(regime_test, causal_features)
             if "actual_return" in preds_r.columns:
-                results[regime_name] = m.compute_all(preds_r["predicted_return"], preds_r["actual_return"], label=regime_name)
+                results[regime_name] = m.compute_all(preds_r["predicted_return"], preds_r["actual_return"], label=f"{regime_name}_OOS")
         except Exception as e:
             logger.warning(f"[diagnostics] Regime {regime_name} evaluation failed: {e}")
 
     # Print concise table
     print(f"\nBaseline diagnostics for {ticker} — overall + per-regime metrics:\n")
+    print(f"WARNING (Issue #5): Overall metrics are computed from an ensemble trained "
+          f"globally on the full historical dataset. Per-regime OOS metrics rely on "
+          f"identical global training weights evaluated out-of-sample.\n")
     for k, v in results.items():
         da = v.get("directional_accuracy", float("nan"))
         rmse = v.get("rmse", float("nan"))

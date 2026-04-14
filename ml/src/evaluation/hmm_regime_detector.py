@@ -245,12 +245,17 @@ class HMMRegimeDetector:
         Instead we use volatility_10d (realised volatility) which captures
         market-regime structure (calm vs turbulent) without directly leaking
         price direction.
+
+        Note (Issue #10): The fallback array still checks for sp500_return_1d
+        as a proxy. Market returns do have mild autocorrelation with the target
+        stock's forward returns. While mathematically valid, reviewers may view
+        these regime labels as weakly endogenous.
         """
         candidates = [
             # VIX (US or India) — first available wins
             ("vix_level",        "india_vix"),
             # Market regime proxy — volatility captures regime without price direction leak
-            ("sp500_return_1d",  "volatility_10d"),
+            ("volatility_10d",   "sp500_return_1d"),
         ]
         selected = []
         for pair in candidates:
@@ -332,7 +337,13 @@ def run_hmm_regime_backtest(
         if not subset.empty:
             hmm_splits[state_name] = subset
 
-    all_feature_cols = [c for c in df.columns if c != bt.target_col]
+    # CRITICAL: Exclude all forward-looking targets, not just target_col
+    leaky_cols = [
+        c for c in df.columns
+        if c.startswith("excess_return_")
+        or (c.startswith("log_return_") and c != "log_return_1d")
+    ]
+    all_feature_cols = [c for c in df.columns if c != bt.target_col and c not in leaky_cols]
     model_variants   = {
         "pcmci_causal": causal_features,
         "all_features": all_feature_cols,

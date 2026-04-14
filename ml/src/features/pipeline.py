@@ -340,9 +340,12 @@ class FeaturePipeline:
         # Always remove forward-looking return columns except the configured target
         # This prevents leakage where a different return column remains as a feature
         # while the configured target is later dropped.
+        # Note: log_return_1d is backward-looking so it is safely retained.
+        # Asymmetry Note: For NIFTY (target=log_return_5d), this column is kept in
+        # the matrix here. For US (target=excess_return_5d), log_return_5d is dropped.
         return_cols = [
             c for c in df.columns
-            if c.startswith("log_return_") or c.startswith("excess_return_")
+            if (c.startswith("log_return_") and c != "log_return_1d") or c.startswith("excess_return_")
         ]
         for c in return_cols:
             if c != self.target_col:

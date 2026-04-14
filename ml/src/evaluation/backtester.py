@@ -54,6 +54,7 @@ class Backtester:
     """
 
     def __init__(self, config_path: Optional[str] = None, cfg: Optional[dict] = None, market: Optional[str] = None):
+        self.config_path = config_path
         # Allow passing an already-loaded config dict (for runtime overrides, e.g. NIFTY)
         self.cfg = cfg if cfg is not None else _load_config(config_path)
         self.metrics = Metrics(config_path)
@@ -125,7 +126,7 @@ class Backtester:
 
             try:
                 # Train a fresh ensemble on this window
-                ensemble = Ensemble(config_path)
+                ensemble = Ensemble(config_path=self.config_path)
                 X_test, y_test = ensemble.train_all(train_df, ticker, causal_features)
 
                 # Predict on test window
@@ -196,8 +197,12 @@ class Backtester:
         """
         logger.info(f"[backtester] Regime backtest for {ticker} ...")
 
+        # CRITICAL: Strip ALL forward-looking targets so the baseline isn't cheating
         all_feature_cols = [
-            c for c in df.columns if c != self.target_col
+            c for c in df.columns
+            if c != self.target_col
+            and not c.startswith("excess_return_")
+            and not (c.startswith("log_return_") and c != "log_return_1d")
         ]
         regime_splits = self.splitter.split_all(df)
         results       = []
@@ -243,7 +248,7 @@ class Backtester:
                 # PCMCI on last 50% of pre-regime training data (consistent with pipeline)
                 df_pcmci = train_df_clean.iloc[-int(len(train_df_clean) * 0.5):]
                 pcmci = PCMCIDiscovery()
-                pcmci_results = pcmci.run(df_pcmci, target=self.target_col)
+                pcmci_results = pcmci.run(df_pcmci, target=self.target_col, exclude_target=True)
 
                 # Select features using selector; do not overwrite saved global file
                 try:
@@ -254,7 +259,9 @@ class Backtester:
 
                 if features_pcmci:
                     # Use regime-specific ticker name so save() does NOT
-                    # overwrite production model files on disk
+                    # overwrite production model files on disk.
+                    # Note (Issue #9): This pollutes the main models/ directory with
+                    # eval artifacts, which could confuse batch load scripts.
                     regime_ticker = f"{ticker}_{regime_name}_eval"
                     # Pass a fresh ensemble to avoid leakage/state issues
                     fresh = Ensemble(config_path=self.config_path)

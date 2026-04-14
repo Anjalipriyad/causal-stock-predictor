@@ -185,7 +185,7 @@ class Ensemble:
             f"{self._causal_features}"
         )
 
-    def train_all(self, df, ticker, causal_features):
+    def train_all(self, df, ticker, causal_features, refit_arima=False):
         """
         Train all base models and the stacking meta-learner.
 
@@ -280,17 +280,26 @@ class Ensemble:
             )
 
         # Final ARIMA refit on train+val for the persisted live-inference model
-        try:
-            self.arima.fit(X_train, y_train, X_val, y_val)
-            self.arima.save(ticker)
-            logger.info("[ensemble] ARIMA refit on train+val and saved.")
-            logger.info(
-                "[ensemble] Note: meta-learner was trained on ARIMA val-forecasts "
-                "produced by the train-only ARIMA. Final ARIMA refit on train+val "
-                "is intentional for live inference (standard practice)."
-            )
-        except Exception as e:
-            logger.warning(f"[ensemble] ARIMA final refit failed: {e}")
+        if refit_arima:
+            try:
+                self.arima.fit(X_train, y_train, X_val, y_val)
+                self.arima.save(ticker)
+                logger.info("[ensemble] ARIMA refit on train+val and saved.")
+                logger.info(
+                    "[ensemble] Note: meta-learner was trained on ARIMA val-forecasts "
+                    "produced by the train-only ARIMA. Final ARIMA refit on train+val "
+                    "is intentional for live inference (standard practice)."
+                )
+            except Exception as e:
+                logger.warning(f"[ensemble] ARIMA final refit failed: {e}")
+        else:
+            try:
+                # Save the train-only ARIMA without refitting (Issue #9 strict protocol)
+                self.arima.save(ticker)
+                logger.info("[ensemble] ARIMA saved without train+val refit "
+                            "(strict meta-learner alignment protocol).")
+            except Exception as e:
+                logger.warning(f"[ensemble] ARIMA save failed: {e}")
 
         return X_test_lgbm_s, y_test
     # -----------------------------------------------------------------------

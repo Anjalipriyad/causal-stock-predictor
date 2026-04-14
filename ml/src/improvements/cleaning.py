@@ -75,7 +75,8 @@ def clean_feature_matrix(
     _target_col = _cfg["model"]["target"]
     leaky_cols = [c for c in df.columns
                   if (c.startswith("log_return_") and c != "log_return_1d")
-                  or c.startswith("excess_return_")]
+                  or c.startswith("excess_return_")
+                  or c in ("direction", "target_q")]
     if leaky_cols:
         logger.warning(
             f"[cleaning] Target/leaky columns found in matrix during cleaning: {leaky_cols}. "

@@ -138,10 +138,30 @@ class RetrainScheduler:
 
             try:
                 ensemble = Ensemble()
-                X_test, y_test = ensemble.train_all(train_df, ticker, causal_features)
+                ensemble.train_all(train_df, ticker, causal_features)
 
-                test_full = pd.concat([X_test, y_test], axis=1)
-                preds     = ensemble.predict_historical(test_full, causal_features)
+                # CRITICAL (Issue #2): Extract the implicit inner validation set from train_df
+                # to track checkpoint fitness, preventing walk-forward test_df leakage.
+                n_train = len(train_df)
+                val_start_idx = int(n_train * 0.70)
+                test_start_idx = int(n_train * 0.85)
+                inner_val_df = train_df.iloc[val_start_idx:test_start_idx]
+                
+                val_preds = ensemble.predict_historical(inner_val_df, causal_features)
+                if "actual_return" in val_preds.columns:
+                    val_scores = metrics.compute_all(
+                        val_preds["predicted_return"],
+                        val_preds["actual_return"],
+                        label=f"{label}_val",
+                    )
+                    val_da = val_scores.get("directional_accuracy", 0)
+                    if val_da > best_da:
+                        best_da     = val_da
+                        best_window = label
+                        self._save_best(ticker, ensemble, label)
+
+                # CRITICAL (Issue #5): Evaluate actual walk-forward test holdout for reporting
+                preds = ensemble.predict_historical(test_df, causal_features)
 
                 if "actual_return" not in preds.columns:
                     window_end = test_end
@@ -153,14 +173,6 @@ class RetrainScheduler:
                     label=label,
                 )
                 results[label] = scores
-
-                # Track best window by directional accuracy
-                da = scores.get("directional_accuracy", 0)
-                if da > best_da:
-                    best_da     = da
-                    best_window = label
-                    # Save this as the "best" model
-                    self._save_best(ticker, ensemble, label)
 
             except Exception as e:
                 logger.warning(f"[retrain] Window {label} failed: {e}")

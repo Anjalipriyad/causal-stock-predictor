@@ -61,13 +61,16 @@ def tune_threshold(
         logger.info("No saved models found — training ensemble to obtain predictions.")
         ensemble.train_all(df, ticker, causal_features)
 
-    # Test slice
-    n_rows = len(df)
+    # CRITICAL: Tune threshold ONLY on the validation set, never the test set.
+    val_ratio = cfg["model"].get("val_ratio", 0.15)
     test_ratio = cfg["model"].get("test_ratio", 0.15)
+    
+    val_start = int(n_rows * (1 - test_ratio - val_ratio))
     test_start = int(n_rows * (1 - test_ratio))
-    test_df = df.iloc[test_start:]
-
-    preds = ensemble.predict_historical(test_df, causal_features)
+    
+    val_df = df.iloc[val_start:test_start]
+    
+    preds = ensemble.predict_historical(val_df, causal_features)
     if "actual_return" not in preds.columns:
         raise RuntimeError("No actual_return column present in predictions; cannot tune threshold.")
 

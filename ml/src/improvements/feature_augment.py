@@ -40,6 +40,10 @@ def augment_features(
     ticker = ticker.upper()
     df = _load_feature_matrix(ticker, market)
 
+    # CRITICAL (Issue #11): Ensure chronological sorting before rolling operations
+    # so lagging doesn't unintentionally pull future records if index is fragmented.
+    df = df.sort_index()
+
     # Decide which numeric columns to augment: causal features if present
     try:
         causal = CausalSelector().load(ticker)
@@ -49,7 +53,14 @@ def augment_features(
     except Exception:
         cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
-    cols = [c for c in cols if c in df.columns]
+    # Guard against leaky columns slipping through causal feature selection
+    leaky_targets = [
+        c for c in df.columns
+        if (c.startswith("log_return_") and c != "log_return_1d")
+        or c.startswith("excess_return_")
+        or c in ("direction", "target_q")
+    ]
+    cols = [c for c in cols if c in df.columns and c not in leaky_targets]
     new_cols = []
 
     # Lag features

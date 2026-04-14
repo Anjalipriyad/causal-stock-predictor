@@ -172,14 +172,26 @@ class StackingMetaLearner:
             B = min(200, max(20, max(20, n_samples // 2)))
             coefs_boot = np.zeros((B, self._n_base_models))
             rng = np.random.default_rng(42)
+            
+            # CRITICAL (Issue #8): Use block bootstrap to preserve time series 
+            # autocorrelation structure. IID resampling destroys dependency.
+            block_size = max(5, int(n_samples ** 0.5))
+            num_blocks = int(np.ceil(n_samples / block_size))
+
             for b in range(B):
-                idx = rng.integers(0, n_samples, n_samples)
+                idx = []
+                for _ in range(num_blocks):
+                    start = rng.integers(0, max(1, n_samples - block_size + 1))
+                    idx.extend(range(start, start + block_size))
+                
+                # Truncate to original length if block sum exceeded n_samples
+                idx = np.array(idx[:n_samples])
+                
                 Xb = X_meta_scaled[idx]
                 yb = y_true[idx]
                 model_b = Ridge(alpha=self.alpha, fit_intercept=True)
                 model_b.fit(Xb, yb)
                 coefs = model_b.coef_
-                # If LSTM was not present during fit, coefs length matches
                 coefs_boot[b, : len(coefs)] = coefs[: self._n_base_models]
 
             coef_se = coefs_boot.std(axis=0)

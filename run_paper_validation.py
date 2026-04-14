@@ -304,6 +304,10 @@ def check_3_significance(df, causal_features, target, ticker, market, results):
         except Exception as e:
             results["significance"] = {"error": f"Ensemble unavailable: {e}"}
             return
+    else:
+        logger.info("[check_3] Note (Issue #6): Loaded model was natively trained "
+                    "on the first 85% of records via 70/15/15 split. The test_df "
+                    "slice accurately corresponds to the final 15% out-of-sample block.")
 
     n       = len(df)
     test_df = df.iloc[int(n * 0.85):]
@@ -461,6 +465,7 @@ def check_5_calibration(df, causal_features, target, ticker, results):
     # meaningless synthetic mapping that makes calibration curves paper-invalid.
     if "confidence" in val_preds.columns:
         raw_conf = val_preds["confidence"]
+        conf_source = "ensemble_actual"
         logger.info("[check_5] Using ensemble's actual confidence scores for calibration.")
     else:
         # Fallback: Generate confidence from individual model agreement if available
@@ -471,6 +476,7 @@ def check_5_calibration(df, causal_features, target, ticker, results):
             directions = val_preds[model_cols].apply(lambda x: (x >= 0).astype(int))
             agreement = directions.mean(axis=1)  # fraction predicting UP
             raw_conf = (2 * (agreement - 0.5).abs()).clip(0.3, 0.9)
+            conf_source = "model_agreement_proxy"
             logger.warning(
                 "[check_5] WARNING: 'confidence' column not in predictions. "
                 "Using model-agreement proxy. For paper evidence, ensure "
@@ -483,6 +489,7 @@ def check_5_calibration(df, causal_features, target, ticker, results):
                 "Calibration results are NOT valid for paper evidence."
             )
             raw_conf = (val_preds["predicted_return"].abs() * 10).clip(0.3, 0.9)
+            conf_source = "INVALID_synthetic_proxy"
 
     correct  = (
         (val_preds["predicted_return"] >= 0) ==
@@ -500,15 +507,59 @@ def check_5_calibration(df, causal_features, target, ticker, results):
         }
         return
 
+    # CRITICAL (Issue #7): Fit the Isotonic calibrator on the validation split ONLY.
+    # Then score calibration out-of-sample on the test partition.
     calibrator = ConfidenceCalibrator(method="isotonic")
     calibrator.fit(raw_conf, correct)
-    calibrator.print_reliability_table(raw_conf, correct)
+
+    test_df = df.iloc[int(n * 0.85):]
+    try:
+        test_preds = ensemble_predict(ensemble, test_df, causal_features)
+    except Exception as e:
+        logger.warning(f"[check_5] OOS test prediction failed: {e}")
+        return
+
+    if "actual_return" not in test_preds.columns:
+        logger.warning("[check_5] No actual_return in test_preds.")
+        return
+
+    # Extract test confidence identically
+    if "confidence" in test_preds.columns:
+        test_conf = test_preds["confidence"]
+    else:
+        model_cols = [c for c in test_preds.columns if c.endswith("_pred")]
+        if len(model_cols) >= 2:
+            import numpy as np
+            directions = test_preds[model_cols].apply(lambda x: (x >= 0).astype(int))
+            agreement = directions.mean(axis=1)
+            test_conf = (2 * (agreement - 0.5).abs()).clip(0.3, 0.9)
+        else:
+            test_conf = (test_preds["predicted_return"].abs() * 10).clip(0.3, 0.9)
+
+    test_correct  = (
+        (test_preds["predicted_return"] >= 0) ==
+        (test_preds["actual_return"] >= 0)
+    ).astype(float)
+
+    mask          = test_conf.notna() & test_correct.notna()
+    test_conf     = test_conf[mask].values
+    test_correct  = test_correct[mask].values
+
+    if len(test_conf) < 30:
+        results["calibration"] = {
+            "skipped": True,
+            "reason":  f"too few OOS test samples ({len(test_conf)})"
+        }
+        return
+
+    calibrator.print_reliability_table(test_conf, test_correct)
 
     results["calibration"] = {
-        "n_val_samples": int(len(raw_conf)),
-        "mean_accuracy": float(correct.mean()),
+        "n_val_samples": int(len(test_conf)),
+        "mean_accuracy": float(test_correct.mean()),
+        "confidence_source": conf_source,
     }
-    logger.info(f"✓ Calibration done (n={len(raw_conf)}, acc={correct.mean():.3f})")
+    logger.info(f"✓ Calibration done OOS (n={len(test_conf)}, acc={test_correct.mean():.3f})")
 
 
 def check_8_sharpe(df, causal_features, target, ticker, results):

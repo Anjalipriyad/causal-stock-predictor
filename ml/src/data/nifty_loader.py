@@ -376,14 +376,14 @@ class NiftyLoader:
         # 1. Load prices
         price_df = self.load_prices()
 
-        # 2. Technical features
+        # 2. Technical features — SAFE: compute_features() returns only
+        #    backward-looking indicators (no shift(-5) targets).
         tech = TechnicalFeatures()
-        tech.set_spy_close(None)   # No SPY benchmark for index prediction
-        # Use compute_all to ensure log_return_5d is present for downstream causal discovery
-        tech_df = tech.compute_all(price_df)
-        # Drop excess_return_5d — equals log_return_5d when spy_close=None
-        if "excess_return_5d" in tech_df.columns:
-            tech_df = tech_df.drop(columns=["excess_return_5d"])
+        tech_feat_df = tech.compute_features(price_df)
+        # Attach ONLY the target column (log_return_5d) separately.
+        # No SPY benchmark for index prediction, so spy_close=None.
+        target_df = tech.compute_targets(price_df, spy_close=None)
+        tech_df = tech_feat_df.join(target_df[["log_return_5d"]], how="left")
 
         # 3. Fundamental features (P/E, P/B, India VIX)
         fund_df = self.load_fundamental_features()
@@ -460,7 +460,14 @@ class NiftyLoader:
         if "log_return_5d" in df.columns:
             df = df.dropna(subset=["log_return_5d"])
             
-        df = df.ffill(limit=5).fillna(0.0)
+        # CRITICAL: Exclude target columns from ffill so future return values
+        # don't get propagated across interior gaps.
+        leaky_cols = [c for c in df.columns 
+                      if (c.startswith("log_return_") and c != "log_return_1d") 
+                      or c.startswith("excess_return_")]
+        safe_cols = [c for c in df.columns if c not in leaky_cols]
+        df[safe_cols] = df[safe_cols].ffill(limit=5)
+        df = df.fillna(0.0)
 
         # Drop any perfectly constant columns (no variance = no signal)
         numeric = df.select_dtypes(include=["number"])

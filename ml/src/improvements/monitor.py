@@ -33,8 +33,17 @@ def monitor_model(ticker: str, market: str = "us", threshold: float = 0.60, test
     cfg = _load_config()
     df = _load_feature_matrix(ticker, market)
 
-    # Recent window
-    recent_df = df.tail(test_period_days)
+    # Recent window — CRITICAL: exclude training data
+    test_ratio = cfg["model"].get("test_ratio", 0.15)
+    test_start = int(len(df) * (1 - test_ratio))
+    safe_tail_len = min(test_period_days, len(df) - test_start)
+    recent_df = df.tail(safe_tail_len)
+    
+    if len(recent_df) < test_period_days:
+        logger.warning(
+            f"monitor: Only {len(recent_df)} out-of-sample test days available "
+            f"(requested {test_period_days}). Reduced window to avoid training data overlap."
+        )
     ensemble = Ensemble(cfg=cfg)
     try:
         ensemble.load(ticker)
