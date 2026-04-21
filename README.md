@@ -1,20 +1,21 @@
 # causal-stock-predictor
 
-
 > **PCMCI-based Feature Selection for Robust Equity Return Prediction Under Market Regime Shifts**
 
-A full-stack stock prediction system built around a reproducible PCMCI-based pipeline — using PCMCI causal-discovery tooling to identify PCMCI-selected features (conditionally independent predictors) rather than relying solely on correlation. Designed for both a research paper and a production web app.
+A full-stack stock prediction system built around a reproducible PCMCI-based pipeline — using causal-discovery tooling to identify conditionally independent predictors rather than relying on correlation alone. Designed for both a research paper and a production web app.
 
 ---
 
 ## What It Does
 
-Given a stock ticker (e.g. `AAPL`), the system:
-1. Identifies which macro + sentiment features are selected by PCMCI (conditionally independent predictors)
+Given a stock ticker (e.g. `AAPL` or `NIFTY`), the system:
+
+1. Identifies which macro + sentiment features are causally linked to returns via Granger + PCMCI
 2. Trains a LightGBM + XGBoost + ARIMA ensemble **only on PCMCI-selected features**
 3. Predicts **5-day forward log return** with a confidence band
-4. Explains **why** it made the prediction (causal drivers)
+4. Explains **why** it made the prediction (causal drivers via SHAP)
 5. Shows robustness across market regimes (bull, crash, recovery, rate hike, AI bull)
+6. Validates paper claims with a single reproducible script
 
 ---
 
@@ -22,11 +23,23 @@ Given a stock ticker (e.g. `AAPL`), the system:
 
 ```
 causal-stock-predictor/
-├── ml/               ← Phase 1 — causal ML layer (build + lock first)
-├── backend/          ← Phase 2 — FastAPI REST API
-├── frontend/         ← Phase 3 — React dashboard
-├── docker-compose.yml
-├── .env.example
+├── ml/
+│   ├── src/
+│   │   ├── causal/          ← Granger, PCMCI, selector, stability
+│   │   ├── data/            ← DataLoader, NiftyLoader, validator
+│   │   ├── evaluation/      ← backtester, metrics, regime_splitter,
+│   │   │                       significance, ablation, hmm_regime_detector
+│   │   ├── features/        ← technical, macro, sentiment, finbert,
+│   │   │                       earnings, options, sector, pipeline
+│   │   ├── improvements/    ← HPO, meta-tuning, feature augmentation,
+│   │   │                       diagnostics, target transform
+│   │   ├── models/          ← lgbm, xgb, arima, lstm, tft, calibration,
+│   │   │                       stacking, regime_model
+│   │   └── ensemble.py      ← weighted ensemble + live/historical predict
+│   ├── tests/               ← pytest test suite
+│   └── scripts/             ← ablation, improvement scripts
+├── run_pipeline.py          ← end-to-end pipeline runner
+├── run_paper_validation.py  ← paper-critical validation checks
 └── README.md
 ```
 
@@ -35,15 +48,17 @@ causal-stock-predictor/
 ## Quickstart
 
 ### 1. Clone + setup environment
+
 ```bash
 git clone https://github.com/your-username/causal-stock-predictor.git
 cd causal-stock-predictor
 
 cp .env.example .env
-# open .env and add your FINNHUB_API_KEY
+# add your FINNHUB_API_KEY to .env
 ```
 
 ### 2. Install ML dependencies
+
 ```bash
 cd ml
 python -m venv .venv
@@ -51,41 +66,60 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Pull historical data
-```bash
-python -m src.data.loader --ticker AAPL
-```
-This pulls OHLCV (2010–2025) from yFinance + sentiment from Finnhub.
-Saved to `ml/data/raw/`. Run once — never again unless you add a new ticker.
+### 3. Run the full pipeline
 
-### 4. Run feature engineering
 ```bash
-python -m src.features.pipeline --ticker AAPL
+# US stock (downloads data automatically)
+python run_pipeline.py --ticker AAPL
+
+# Indian market (Nifty 50 index)
+python run_pipeline.py --ticker NIFTY --market india
+
+# Individual NSE stock
+python run_pipeline.py --ticker RELIANCE.NS --market india
 ```
-Saved to `ml/data/processed/features/AAPL_features.csv`
 
-FinBERT ablation: FinBERT-based sentiment scoring is supported for headline-based features. Enable it when building features (slow on CPU) with the `--finbert` flag, e.g. `python -m ml.src.data.nifty_loader --finbert` or via the pipeline `--finbert` option.
+The pipeline auto-detects what already exists on disk and skips completed steps. Use `--full-retrain` to force a complete rebuild.
 
-### 5. Run causal discovery
+### 4. Pipeline flags
+
+| Flag | Description |
+|---|---|
+| `--predict-only` | Run live prediction only (models must exist) |
+| `--refresh-data` | Re-download data even if already cached |
+| `--full-retrain` | Force rebuild features + causal discovery + retrain |
+| `--paper-eval` | Run full Option B regime backtest (~1hr) |
+| `--with-retrain` | Walk-forward retraining (~1hr) |
+| `--with-regime` | Regime-aware model training (~40min) |
+| `--finbert` | Use FinBERT for sentiment scoring (GPU recommended) |
+
+### 5. Run paper validation
+
 ```bash
-python -m src.causal.selector --ticker AAPL
-```
-Runs Granger + PCMCI. Saves causal feature list to:
-`ml/saved_models/causal_features_AAPL.json`
+# Quick mode (skips slow PCMCI stability check)
+python run_paper_validation.py --ticker AAPL --quick
 
-### 6. Train models
-```bash
-python -m src.models.lgbm_model --ticker AAPL
-python -m src.models.xgb_model  --ticker AAPL
-python -m src.models.arima_model --ticker AAPL
-```
-Saves trained weights to `ml/saved_models/`
+# Full validation (all checks)
+python run_paper_validation.py --ticker AAPL
 
-### 7. Run backtesting
-```bash
-python -m src.evaluation.backtester --ticker AAPL
+# Indian market
+python run_paper_validation.py --ticker NIFTY --market india --quick
 ```
-Prints regime-split evaluation table.
+
+---
+
+## Pipeline Steps
+
+The pipeline runs these steps in order, skipping any that are already complete:
+
+```
+Step 1  Load historical data         (yFinance / uploaded CSV for India)
+Step 2  Feature engineering          (~30 candidate features)
+Step 3  Causal discovery             (Granger + PCMCI on training split only)
+Step 4  Train models                 (LightGBM, XGBoost, ARIMA ensemble)
+Step 5  Live prediction + reporting  (Option B regime performance table)
+Step 6  Full regime backtest         (opt-in via --paper-eval)
+```
 
 ---
 
@@ -97,14 +131,19 @@ Raw Data (yFinance + Finnhub)
 Feature Engineering (~30 candidate features)
   ├── Technical  — RSI, MACD, Bollinger, momentum, volatility
   ├── Macro      — VIX, yield spread, DXY, oil, gold, S&P 500
-  └── Sentiment  — Finnhub news sentiment, rolling averages
+  ├── Sentiment  — Finnhub news sentiment, rolling averages
+  ├── Earnings   — EPS surprise, P/E, P/B
+  ├── Options    — put/call ratio, implied volatility
+  └── Sector     — sector relative performance
         ↓
-Causal Discovery
-  ├── Granger Causality    (baseline)
-  └── PCMCI / ParCorr      (primary — via tigramite)
+Causal Discovery  (training split only — no test leakage)
+  ├── Granger Causality    (baseline, full training set)
+  └── PCMCI / ParCorr      (last 50% of training set, via tigramite)
         ↓
-Causal Feature Set (6–12 features)
-  └── saved to causal_features_{ticker}.json
+Adaptive Feature Selection
+  ├── Default: intersection of Granger + PCMCI findings
+  ├── Fallback: iteratively relax p-value thresholds → union → top-N by PCMCI p-value
+  └── Saved to  ml/saved_models/causal_features_{TICKER}.json
         ↓
 Ensemble Model
   ├── LightGBM  (weight: 0.50)
@@ -112,30 +151,52 @@ Ensemble Model
   └── ARIMA     (weight: 0.15)
         ↓
 PredictionResult
-  ├── predicted_return   (5-day log return)
+  ├── predicted_return   (5-day log / excess return)
   ├── predicted_price
   ├── direction          UP | DOWN
   ├── confidence         0–1
-  ├── upper_band
-  ├── lower_band
-  └── causal_drivers     [ {feature, impact} ]
+  ├── upper_band / lower_band
+  └── causal_drivers     [ {feature, impact, shap} ]
 ```
+
+---
+
+## Paper Validation Checks
+
+`run_paper_validation.py` runs all paper-critical checks and saves results to `ml/logs/`:
+
+| Check | Description |
+|---|---|
+| **1 — PCMCI Stability** | Sliding-window Jaccard similarity; flags unstable feature sets |
+| **2 — ATR Diagnostic** | Nifty H/L contamination check (skipped for non-Nifty tickers) |
+| **3 — Statistical Significance** | Binomial test + bootstrap CI for directional accuracy vs 50% baseline |
+| **4 — ARIMA Variance** | Verifies ARIMA predictions are non-constant |
+| **5 — Confidence Calibration** | Isotonic calibration ECE fitted on val, scored on OOS test |
+| **6 — Ablation Table** | Full-feature vs PCMCI-only vs Granger-only comparison (--full) |
+| **7 — HMM Regime Robustness** | HMM-detected regimes vs manual regime labels (skipped in --quick) |
+| **8 — Sharpe Comparison** | Original flat-cost vs turnover-corrected vs confidence-weighted Sharpe |
 
 ---
 
 ## Research Approach
 
-The core novelty is the **two-stage pipeline**:
+The core novelty is a **two-stage pipeline**:
 
-1. **PCMCI Discovery** — PCMCI identifies lagged conditional-independence links (PCMCI-selected features) between macro/sentiment features and stock returns. Unlike simple pairwise correlation, PCMCI controls for confounders and provides a stricter statistical filter; this is *not* an interventional proof of causality and should be described in the paper as "PCMCI-selected features (conditional independence)".
-   
-  Adaptive selection: the code now implements an adaptive feature-selection fallback. By default the pipeline uses a strict `intersection` of Granger + PCMCI findings; if too few features are selected the selector will iteratively relax Granger/PCMCI p-value thresholds, then fall back to `union`, and finally pick top features by PCMCI p-value if needed. Selection metadata is recorded in `saved_models/causal_features_{TICKER}.json` for transparency.
+**Stage 1 — PCMCI Discovery**: PCMCI identifies lagged conditional-independence links between macro/sentiment features and stock returns. Unlike simple pairwise correlation, PCMCI controls for confounders and provides a stricter statistical filter. This is described in the paper as "PCMCI-selected features (conditional independence)" — not interventional causality.
 
-2. **Regime Robustness** — Models trained on PCMCI-selected features may degrade less under regime shifts than models trained on all correlated features. The repository includes code to compute bootstrap confidence intervals for directional accuracy to test whether observed differences are statistically significant.
+**Stage 2 — Regime Robustness**: Models trained on PCMCI-selected features degrade less under regime shifts than models trained on all correlated features. Bootstrap confidence intervals test whether observed differences are statistically significant.
 
-Note: ticker selection in this repository (large-cap, surviving names) can introduce survivorship bias. For paper submission include a short robustness check with de-listed or underperforming tickers or clearly document this limitation.
+### Target Variable
+
+| Target | Use case |
+|---|---|
+| `excess_return_5d` | Individual US equities — stock return minus benchmark (SPY). **Recommended default.** |
+| `log_return_5d` | Market indexes (e.g. NIFTY) — raw 5-day log return; subtracting the index from itself is meaningless. |
+
+NIFTY automatically uses `log_return_5d` via a local config override (never mutating global config).
 
 ### Evaluation Regimes
+
 | Regime | Period |
 |---|---|
 | Bull market | 2010 – 2019 |
@@ -145,17 +206,29 @@ Note: ticker selection in this repository (large-cap, surviving names) can intro
 | AI bull run | 2023 – 2025 |
 
 ### Key Metrics
+
 - Directional accuracy (% correct up/down calls)
-- Sharpe ratio (annualised)
+- Sharpe ratio (annualised, turnover-corrected)
 - RMSE + MAPE on log returns
-- Max drawdown
-- Calmar ratio
+- Max drawdown / Calmar ratio
+
+---
+
+## Data Leakage Prevention
+
+Several explicit safeguards prevent leakage:
+
+- Causal discovery runs on the **training split only** (controlled by `train_ratio` in `config.yaml`)
+- Both `excess_return_5d` and `log_return_5d` (forward-looking columns) are **dropped** before feeding data into PCMCI/Granger
+- PCMCI runs with `exclude_target=True` to avoid target-variable contamination inside the conditional independence graph
+- Calibration is fitted on the val split and scored on the held-out test split
 
 ---
 
 ## Tech Stack
 
 ### ML
+
 | Library | Purpose |
 |---|---|
 | `yfinance` | Historical OHLCV data |
@@ -164,12 +237,14 @@ Note: ticker selection in this repository (large-cap, surviving names) can intro
 | `tigramite` | PCMCI causal discovery |
 | `statsmodels` | Granger causality + ARIMA |
 | `lightgbm` | Primary forecasting model |
-| `xgboost` | Comparison model |
+| `xgboost` | Ensemble model |
 | `scikit-learn` | Preprocessing + metrics |
 | `shap` | Model interpretability |
 | `pmdarima` | Auto ARIMA |
+| `hmmlearn` | HMM regime detection (optional) |
 
 ### Backend (Phase 2)
+
 | Library | Purpose |
 |---|---|
 | `fastapi` | REST API framework |
@@ -177,6 +252,7 @@ Note: ticker selection in this repository (large-cap, surviving names) can intro
 | `pydantic` | Request/response schemas |
 
 ### Frontend (Phase 3)
+
 | Library | Purpose |
 |---|---|
 | `react` + `vite` | UI framework |
@@ -190,9 +266,9 @@ Note: ticker selection in this repository (large-cap, surviving names) can intro
 
 | Phase | Status | Description |
 |---|---|---|
-| **Phase 1 — ML** | 🔄 In progress | Causal discovery + model training |
-| **Phase 2 — Backend** | ⬜ Not started | FastAPI wrapper around ML layer |
-| **Phase 3 — Frontend** | ⬜ Not started | React dashboard |
+| **Phase 1 — ML** | In progress | Causal discovery + model training |
+| **Phase 2 — Backend** | Not started | FastAPI wrapper around ML layer |
+| **Phase 3 — Frontend** | Not started | React dashboard |
 
 ---
 
@@ -206,7 +282,7 @@ cp .env.example .env
 
 | Variable | Required | Description |
 |---|---|---|
-| `FINNHUB_API_KEY` | ✅ Phase 1 | Get free key at finnhub.io |
+| `FINNHUB_API_KEY` | Phase 1 | Free key at finnhub.io |
 | `ML_SAVED_MODELS_DIR` | Phase 2 | Path to saved model weights |
 | `ML_CONFIG_PATH` | Phase 2 | Path to config.yaml |
 | `BACKEND_HOST` | Phase 2 | FastAPI host |
@@ -215,34 +291,14 @@ cp .env.example .env
 
 ---
 
-## License
+## Known Limitations
 
-MIT
+- **Survivorship bias**: ticker selection uses large-cap surviving names. For paper submission include a robustness check with de-listed or underperforming tickers, or document this limitation explicitly.
+- **NIFTY live prediction**: skipped — real-time P/E, P/B, and news headlines are not available for the index.
+- **PCMCI instability**: if the Jaccard similarity across windows is low (verdict = UNSTABLE), the paper should disclose this and use the `union` selection strategy.
 
 ---
 
-## Target variable choice
+## License
 
-For the paper and experiments we predict a fixed forward-return target (the
-`model.target` value in `config.yaml`). The code supports two commonly used
-targets:
-
-- `excess_return_5d`: market-adjusted 5-day log return (stock return minus
-  benchmark return) — appropriate when the goal is to predict alpha (stock
-  performance relative to the market). This is the recommended default for
-  individual US equities where a reliable market benchmark (e.g. SPY) exists.
-- `log_return_5d`: raw 5-day log return — appropriate for market indexes
-  (e.g. NIFTY) where subtracting the index from itself is meaningless.
-
-The repository no longer performs silent in-place mutations of the loaded
-configuration. If a per-market override is required (for example, predicting
-index returns for NIFTY), a local config override is used at runtime and is
-logged explicitly. For paper submission you should *choose one* target and
-report the choice and its justification in the Methods section (recommended:
-use `excess_return_5d` for single-stock alpha prediction; use
-`log_return_5d` only when modelling index-level returns).
-
-If you'd like, I can (1) enforce a single target across all experiments by
-updating `config.yaml` and the paper text, or (2) add a clear CLI/config
-switch for per-market targets and surface that choice in exported experiment
-metadata. Which would you prefer?
+MIT
