@@ -472,9 +472,11 @@ class Ensemble:
         # Base model predictions
         pred_lgbm  = self.lgbm.predict_raw(X_lgbm)
         pred_xgb   = self.xgb.predict_raw(X_xgb)
-        # If actual targets are present, use ARIMA's rolling predict_val_set
-        # to simulate online one-step forecasts; otherwise fall back to
-        # predict_raw(X) which uses in-sample/rolling logic.
+        # ARIMA: Use rolling predict-then-update forecasting when actual
+        # targets are available. This is standard online forecasting — the
+        # prediction at time t is made BEFORE seeing y[t], then y[t] is used
+        # to update the model state for the next prediction. NOT leakage.
+        # Falls back to predict_raw(X) when no targets available (live mode).
         pred_arima = self.arima.predict_val_set(y) if y is not None else self.arima.predict_raw(X)
 
         # Optional LSTM

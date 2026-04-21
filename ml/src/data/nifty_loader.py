@@ -467,7 +467,22 @@ class NiftyLoader:
                       or c.startswith("excess_return_")]
         safe_cols = [c for c in df.columns if c not in leaky_cols]
         df[safe_cols] = df[safe_cols].ffill(limit=5)
-        df = df.fillna(0.0)
+        # AUDIT FIX: Do NOT fill target/leaky columns with zero — that creates
+        # fabricated zero-return observations. Drop any remaining rows where the
+        # target is still NaN (interior gaps), then zero-fill only safe columns.
+        if "log_return_5d" in df.columns:
+            remaining_nans = df["log_return_5d"].isna().sum()
+            if remaining_nans > 0:
+                logger.info(
+                    f"[nifty_loader] Dropping {remaining_nans} rows with NaN target "
+                    f"(interior gaps — not zero-filled to avoid fabricated returns)"
+                )
+                df = df.dropna(subset=["log_return_5d"])
+        df[safe_cols] = df[safe_cols].fillna(0.0)
+        # Leaky cols: drop remaining NaN rows rather than zero-fill
+        for lc in leaky_cols:
+            if lc in df.columns:
+                df = df.dropna(subset=[lc])
 
         # Drop any perfectly constant columns (no variance = no signal)
         numeric = df.select_dtypes(include=["number"])
