@@ -107,6 +107,16 @@ class StabilityReport:
             return "union"
 
 
+def jaccard_similarity(set_a: set, set_b: set) -> float:
+    """Jaccard similarity: |A ∩ B| / |A ∪ B|. Returns 1.0 if both empty."""
+    if not set_a and not set_b:
+        return 1.0
+    union = set_a | set_b
+    if not union:
+        return 0.0
+    return len(set_a & set_b) / len(union)
+
+
 class PCMCIStabilityAnalyzer:
     """
     Tests PCMCI feature stability across multiple rolling sub-windows
@@ -184,7 +194,7 @@ class PCMCIStabilityAnalyzer:
         # Compute pairwise Jaccard similarity
         pairwise_jaccard = []
         for a, b in combinations(range(self.n_windows), 2):
-            j = self._jaccard(feature_sets[a], feature_sets[b])
+            j = jaccard_similarity(feature_sets[a], feature_sets[b])
             pairwise_jaccard.append(j)
 
         mean_j = float(np.mean(pairwise_jaccard)) if pairwise_jaccard else 0.0
@@ -244,13 +254,8 @@ class PCMCIStabilityAnalyzer:
 
     @staticmethod
     def _jaccard(set_a: set, set_b: set) -> float:
-        """Jaccard similarity: |A ∩ B| / |A ∪ B|. Returns 1.0 if both empty."""
-        if not set_a and not set_b:
-            return 1.0
-        union = set_a | set_b
-        if not union:
-            return 0.0
-        return len(set_a & set_b) / len(union)
+        """Delegates to module-level jaccard_similarity(). Kept for backward compatibility."""
+        return jaccard_similarity(set_a, set_b)
 
     def select_features_by_stability(
         self, report: StabilityReport

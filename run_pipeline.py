@@ -146,11 +146,16 @@ def step3_causal_discovery(ticker: str) -> list[str]:
     feat_path = get_feat_path(ticker)
     df        = pd.read_csv(feat_path, index_col=0, parse_dates=True)
 
-    # For NIFTY index — use log_return_5d as target (excess_return vs itself = 0)
+    # For NIFTY index — prefer excess_return_5d if it exists and has real signal,
+    # otherwise use log_return_5d (excess return vs itself = 0)
     # For individual stocks — use excess_return_5d (vs market benchmark)
     if is_nifty_ticker(ticker):
-        target = "log_return_5d"
-        logger.info("[causal] NIFTY index detected — using log_return_5d as target")
+        if "excess_return_5d" in df.columns and not (df["excess_return_5d"] == 0).all():
+            target = "excess_return_5d"
+            logger.info("[causal] NIFTY: excess_return_5d has signal — using as target")
+        else:
+            target = "log_return_5d"
+            logger.info("[causal] NIFTY: using log_return_5d as target (excess_return not available or all zeros)")
     else:
         target = cfg["model"]["target"]
 
@@ -467,6 +472,151 @@ def step6_regime_backtest(
     print(f"{'='*W}")
 
 
+# ── Step 7: Full Paper Analysis Suite ─────────────────────────────────────────
+
+def step7_paper_analysis(
+    ticker: str,
+    causal_features: list[str],
+    df: "pd.DataFrame",
+    market: str = "india",
+    skip_pcmci: bool = False,
+) -> None:
+    """
+    Run the full paper analysis suite:
+      A. Leakage check
+      B. Per-regime causal discovery + stability analysis (Table 3)
+      C. Regime characterisation (Table 1)
+      D. Full backtesting with 4 model variants (Table 2)
+      E. Summary statistics
+      F. Consolidated output to paper_output/{ticker}/
+    """
+    import json
+    from pathlib import Path
+    from ml.src.data.loader import _load_config
+
+    banner(f"STEP 7 — FULL PAPER ANALYSIS ({ticker})")
+    start = time.time()
+    cfg = _load_config()
+
+    output_dir = ROOT / "paper_output" / ticker.upper()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "figures").mkdir(exist_ok=True)
+
+    # ── A. Leakage check ──────────────────────────────────────────────────
+    banner("Step 7A — Leakage Verification")
+    from ml.src.data.validator import check_price_level_leakage
+    leaky = check_price_level_leakage(df)
+    if leaky:
+        logger.warning(
+            f"[paper] LEAKAGE DETECTED: {leaky} — these should have been "
+            f"dropped during feature engineering. Check pipeline."
+        )
+        # Drop them now as a safety net
+        df = df.drop(columns=[c for c in leaky if c in df.columns])
+    else:
+        logger.info("[paper] ✓ No price-level leakage detected.")
+
+    # ── B. Per-regime causal discovery ────────────────────────────────────
+    banner("Step 7B — Per-Regime Causal Discovery")
+    try:
+        from ml.src.causal.causal_stability import CausalStabilityAnalyser
+
+        # Use training data only for causal discovery
+        train_ratio = cfg["model"]["train_ratio"]
+        train_end = int(len(df) * train_ratio)
+        df_train = df.iloc[:train_end]
+
+        analyser = CausalStabilityAnalyser(
+            market=market, skip_pcmci=skip_pcmci,
+        )
+        regime_feature_sets = analyser.run(df_train, ticker, market=market)
+
+        # Stability analysis + Table 3
+        stability_results = analyser.analyse_stability(regime_feature_sets)
+        analyser.print_stability_table(stability_results)
+        analyser.save_stability_report(stability_results, ticker, output_dir)
+        logger.info(f"[paper] Table 3 (causal stability) saved → {output_dir}")
+    except Exception as e:
+        logger.error(f"[paper] Per-regime causal discovery failed: {e}")
+        regime_feature_sets = {"global": causal_features}
+        stability_results = {}
+
+    # ── C. Regime characterisation (Table 1) ──────────────────────────────
+    banner("Step 7C — Regime Characterisation (Table 1)")
+    try:
+        from ml.src.evaluation.regime_characteriser import RegimeCharacteriser
+
+        characteriser = RegimeCharacteriser(market=market)
+        regime_table = characteriser.characterise(df, ticker, market=market, save=True)
+        characteriser.explain_regimes()
+        logger.info(f"[paper] Table 1 (regime characterisation) saved → {output_dir}")
+    except Exception as e:
+        logger.error(f"[paper] Regime characterisation failed: {e}")
+
+    # ── D. Full backtesting with 4 model variants (Table 2) ───────────────
+    banner("Step 7D — Regime Backtest (Table 2)")
+    try:
+        from ml.src.evaluation.backtester import Backtester
+
+        bt = Backtester(market=market)
+        results_df = bt.regime_backtest(df, ticker, causal_features)
+
+        if not results_df.empty:
+            # Save Table 2
+            table2_path = output_dir / "table2_regime_backtest.csv"
+            results_df.to_csv(table2_path)
+            logger.info(f"[paper] Table 2 (regime backtest) saved → {table2_path}")
+
+            # Feature overlap analysis
+            if regime_feature_sets:
+                overlap_df = bt.compute_feature_overlap(
+                    causal_features, regime_feature_sets
+                )
+                if not overlap_df.empty:
+                    overlap_path = output_dir / "feature_overlap.csv"
+                    overlap_df.to_csv(overlap_path)
+                    logger.info(f"[paper] Feature overlap saved → {overlap_path}")
+
+            # ── E. Summary statistics ─────────────────────────────────────
+            banner("Step 7E — Summary Statistics")
+            summary = bt.summary_statistics(results_df)
+
+            summary_path = output_dir / "summary_statistics.txt"
+            with open(summary_path, "w") as f:
+                f.write(f"Summary Statistics — {ticker}\n")
+                f.write(f"{'='*60}\n")
+                for model_name, stats in summary.items():
+                    if isinstance(stats, dict):
+                        f.write(
+                            f"{model_name:20s}: "
+                            f"DA mean={stats['mean_da']:.4f} ± {stats['std_da']:.4f}, "
+                            f"range=[{stats['min_da']:.4f}, {stats['max_da']:.4f}], "
+                            f"degradation={stats['da_degradation']:.4f}\n"
+                        )
+                sr = summary.get("stability_ratio")
+                if sr is not None:
+                    f.write(f"\nStability ratio (pcmci_std / all_std): {sr:.4f}\n")
+                    f.write(
+                        "→ Causal model is MORE stable\n"
+                        if sr < 1.0 else
+                        "→ Causal model is LESS stable\n"
+                    )
+            logger.info(f"[paper] Summary statistics saved → {summary_path}")
+
+    except Exception as e:
+        logger.error(f"[paper] Backtesting failed: {e}")
+
+    # ── F. Consolidated output summary ────────────────────────────────────
+    banner(f"Paper Analysis Complete — {elapsed(start)} total")
+    print(f"\n  Output directory: {output_dir}")
+    print(f"  Files generated:")
+    for f in sorted(output_dir.glob("*")):
+        if f.is_file():
+            size_kb = f.stat().st_size / 1024
+            print(f"    {f.name:45s}  ({size_kb:.1f} KB)")
+    print()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -485,6 +635,10 @@ Examples:
     python run_pipeline.py --ticker NIFTY --market india --predict-only
     python run_pipeline.py --ticker NIFTY --market india --paper-eval
     python run_pipeline.py --ticker RELIANCE.NS --market india
+
+  Paper analysis (full suite — Tables 1+2+3 + summary):
+    python run_pipeline.py --ticker NIFTY --market india --paper-analysis
+    python run_pipeline.py --ticker NIFTY --market india --paper-analysis --skip-pcmci
         """
     )
     parser.add_argument("--ticker",       type=str, required=True,
@@ -506,6 +660,12 @@ Examples:
                         help="Also train regime-aware models (~40min)")
     parser.add_argument("--finbert", action="store_true",
                         help="Use FinBERT for sentiment scoring (slow on CPU, requires GPU ideally)")
+    parser.add_argument("--paper-analysis", action="store_true",
+                        help="Run full paper analysis: regime characterisation, per-regime "
+                             "causal discovery, backtesting with all model variants (~2-3 hrs)")
+    parser.add_argument("--skip-pcmci", action="store_true",
+                        help="Use only Granger for per-regime causal discovery (faster, "
+                             "use with --paper-analysis)")
     args   = parser.parse_args()
 
     # Normalise ticker
@@ -604,6 +764,16 @@ Examples:
             import pandas as pd
             df_full = pd.read_csv(feat_path, index_col=0, parse_dates=True)
             step6_regime_backtest(ticker, causal_features, df_full, market=args.market)
+
+        # Step 7 — Full paper analysis suite (opt-in)
+        if args.paper_analysis:
+            import pandas as pd
+            df_full = pd.read_csv(feat_path, index_col=0, parse_dates=True)
+            step7_paper_analysis(
+                ticker, causal_features, df_full,
+                market=args.market,
+                skip_pcmci=args.skip_pcmci,
+            )
 
         banner(f"PIPELINE COMPLETE — {elapsed(total_start)} total")
 

@@ -453,6 +453,19 @@ class NiftyLoader:
 # Add:
         from ml.src.features.nifty_feature_guard import apply_nifty_feature_guard_to_pipeline
         df = apply_nifty_feature_guard_to_pipeline(df)
+
+        # 5b. Drop raw price-level columns — these encode absolute prices,
+        # not ratios/returns, and cause data leakage if used as features.
+        # bb_width and bb_pct are safe (ratios) and are kept.
+        from ml.src.data.validator import check_price_level_leakage, PRICE_LEVEL_COLUMNS
+        leaky_found = check_price_level_leakage(df)
+        price_cols_to_drop = [c for c in PRICE_LEVEL_COLUMNS if c in df.columns]
+        if price_cols_to_drop:
+            df = df.drop(columns=price_cols_to_drop)
+            logger.info(
+                f"[nifty_loader] Dropped {len(price_cols_to_drop)} price-level columns "
+                f"to prevent leakage: {price_cols_to_drop}"
+            )
         
         # 6. Final cleanup
         # CRITICAL: Drop trailing rows where the forward-looking target is legitimately unavailable 

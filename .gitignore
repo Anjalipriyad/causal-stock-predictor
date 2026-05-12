@@ -78,6 +78,10 @@ ml/saved_models/*.joblib
 # Logs
 ml/logs/
 
+# Paper analysis output — regenerated via --paper-analysis
+paper_output/
+!paper_output/.gitkeep
+
 # Jupyter notebooks — strip outputs before committing
 # (outputs contain data that shouldn't be in git)
 .ipynb_checkpoints/

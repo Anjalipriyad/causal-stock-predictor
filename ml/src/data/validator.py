@@ -384,3 +384,47 @@ class DataValidator:
                     + "\n".join(report.errors)
                 )
         return report
+
+
+# ---------------------------------------------------------------------------
+# Price-level leakage detection
+# ---------------------------------------------------------------------------
+
+PRICE_LEVEL_COLUMNS = [
+    'close', 'high', 'low', 'open', 'volume',
+    'bb_lower', 'bb_mid', 'bb_upper',
+]
+"""
+Raw price-level columns that encode absolute prices, not ratios/returns.
+If any of these appear in a feature matrix used for causal discovery or
+model training, the model can trivially predict future prices from current
+price level — a severe form of data leakage.
+
+Safe ratio-based Bollinger features (bb_width, bb_pct) are NOT in this list.
+"""
+
+
+def check_price_level_leakage(df: pd.DataFrame) -> list[str]:
+    """
+    Check if any raw price-level columns are present in a feature matrix.
+
+    These encode absolute price levels, not ratios/returns, and will
+    cause data leakage if used as features in causal discovery or model
+    training.
+
+    Args:
+        df: Feature matrix to check.
+
+    Returns:
+        List of leaky column names found. Empty list if clean.
+    """
+    found = [c for c in PRICE_LEVEL_COLUMNS if c in df.columns]
+    if found:
+        logger.warning(
+            f"[validator] PRICE LEVEL LEAKAGE: found {len(found)} raw price columns "
+            f"in feature matrix: {found}. These must be dropped before causal "
+            f"discovery or model training."
+        )
+    else:
+        logger.info("[validator] Price-level leakage check passed — no raw price columns found.")
+    return found

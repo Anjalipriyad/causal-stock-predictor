@@ -164,6 +164,17 @@ class FeaturePipeline:
         # 7. Clean up
         df = self._clean(df)
 
+        # 7b. Drop raw price-level columns — prevents leakage
+        from ml.src.data.validator import check_price_level_leakage, PRICE_LEVEL_COLUMNS
+        leaky_found = check_price_level_leakage(df)
+        price_cols_to_drop = [c for c in PRICE_LEVEL_COLUMNS if c in df.columns]
+        if price_cols_to_drop:
+            logger.info(
+                f"[pipeline] Dropping {len(price_cols_to_drop)} price-level columns "
+                f"to prevent leakage: {price_cols_to_drop}"
+            )
+            df = df.drop(columns=price_cols_to_drop)
+
         # 8. Validate final matrix
         report = self.validator.validate_feature_matrix(df, name=f"{ticker} features")
         if not report.passed:

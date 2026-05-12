@@ -214,6 +214,27 @@ class CausalSelector:
                 f"Unknown strategy '{self.strategy}'. Use 'intersection' or 'union'."
             )
 
+        # Post-selection leakage guard — strip any price-level columns
+        # that may have survived causal discovery. These encode absolute price
+        # levels, not ratios/returns, and cause data leakage.
+        PRICE_LEVEL_COLS = {'close', 'high', 'low', 'open', 'bb_lower', 'bb_mid', 'bb_upper'}
+        leaked = [f for f in feature_names if f in PRICE_LEVEL_COLS]
+        if leaked:
+            logger.warning(
+                f"[selector] Removing {len(leaked)} price-level columns from "
+                f"causal features: {leaked}"
+            )
+            feature_names = [f for f in feature_names if f not in PRICE_LEVEL_COLS]
+            # Adjust min_causal_features if removal drops below threshold
+            if len(feature_names) < self.min_causal_features:
+                adjusted_min = max(3, len(feature_names))
+                logger.warning(
+                    f"[selector] After removing leaked columns, only {len(feature_names)} "
+                    f"features remain (min was {self.min_causal_features}). "
+                    f"Adjusting min to {adjusted_min}."
+                )
+                self.min_causal_features = adjusted_min
+
         # Enforce limits (cap at max, ensure min satisfied)
         # If feature_names is longer than max, _enforce_limits will cap it.
         feature_names = self._enforce_limits(feature_names, ticker)

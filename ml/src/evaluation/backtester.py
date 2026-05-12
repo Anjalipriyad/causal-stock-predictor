@@ -227,72 +227,120 @@ class Backtester:
                 )
                 continue
 
-            # ------------------ PCMCI causal variant ------------------
-            try:
-                # CRITICAL: Strip forward-looking target columns before causal discovery.
-                # train_df contains excess_return_5d and log_return_5d which encode
-                # shift(-horizon) future prices. If PCMCI sees these, any feature with
-                # autocorrelation to price will appear causally linked via shared
-                # future information, inflating Table 2 directional accuracy.
-                leaky_cols = [c for c in train_df.columns
-                              if c.startswith("log_return_") and c != "log_return_1d"
-                              or c.startswith("excess_return_")]
-                # Keep only the configured target for Granger (it needs y in the df)
-                cols_to_drop = [c for c in leaky_cols if c != self.target_col]
-                train_df_clean = train_df.drop(columns=cols_to_drop, errors="ignore")
+            # CRITICAL: Strip forward-looking target columns before causal discovery.
+            # train_df contains excess_return_5d and log_return_5d which encode
+            # shift(-horizon) future prices. If PCMCI sees these, any feature with
+            # autocorrelation to price will appear causally linked via shared
+            # future information, inflating Table 2 directional accuracy.
+            leaky_cols = [c for c in train_df.columns
+                          if c.startswith("log_return_") and c != "log_return_1d"
+                          or c.startswith("excess_return_")]
+            # Keep only the configured target for Granger (it needs y in the df)
+            cols_to_drop = [c for c in leaky_cols if c != self.target_col]
+            train_df_clean = train_df.drop(columns=cols_to_drop, errors="ignore")
 
-                # Granger on full pre-regime training set (target column kept for Granger)
+            # ── Granger always runs — it's the baseline ─────────────────
+            granger_results = None
+            try:
                 granger = GrangerCausality()
                 granger_results = granger.run(train_df_clean, target=self.target_col, verbose=False)
+            except Exception as e:
+                logger.error(f"[backtester] Granger failed for {regime_name}: {e}")
 
-                # PCMCI on last 50% of pre-regime training data (consistent with pipeline)
+            # ── PCMCI runs independently — failure doesn't affect Granger
+            pcmci_results = None
+            try:
                 df_pcmci = train_df_clean.iloc[-int(len(train_df_clean) * 0.5):]
                 pcmci = PCMCIDiscovery()
                 pcmci_results = pcmci.run(df_pcmci, target=self.target_col, exclude_target=True)
-
-                # Select features using selector; do not overwrite saved global file
-                try:
-                    features_pcmci = self.selector.select(ticker, granger_results, pcmci_results, save=False)
-                except Exception as e:
-                    logger.warning(f"[backtester] Causal selector failed for {regime_name}: {e}")
-                    features_pcmci = []
-
-                if features_pcmci:
-                    # Use regime-specific ticker name so save() does NOT
-                    # overwrite production model files on disk.
-                    # Note (Issue #9): This pollutes the main models/ directory with
-                    # eval artifacts, which could confuse batch load scripts.
-                    regime_ticker = f"{ticker}_{regime_name}_eval"
-                    # Pass a fresh ensemble to avoid leakage/state issues
-                    fresh = Ensemble(config_path=self.config_path)
-                    fresh.train_all(train_df, regime_ticker, features_pcmci)
-                    preds = fresh.predict_historical(regime_df, features_pcmci)
-                    if "actual_return" in preds.columns:
-                        scores = self.metrics.compute_all(
-                            preds["predicted_return"],
-                            preds["actual_return"],
-                            label=f"pcmci_selected/{regime_name}",
-                        )
-                        # Bootstrap CI for directional accuracy
-                        try:
-                            lo, hi = self.metrics.bootstrap_da_ci(
-                                preds["predicted_return"], preds["actual_return"]
-                            )
-                            scores["directional_accuracy_ci_lower"] = lo
-                            scores["directional_accuracy_ci_upper"] = hi
-                        except Exception:
-                            scores["directional_accuracy_ci_lower"] = float("nan")
-                            scores["directional_accuracy_ci_upper"] = float("nan")
-
-                        scores["model"] = "pcmci_selected"
-                        scores["regime"] = regime_name
-                        scores["n_test"] = len(regime_df)
-                        results.append(scores)
-                else:
-                    logger.warning(f"[backtester] No causal features for {regime_name}; skipping pcmci_causal.")
-
             except Exception as e:
-                logger.warning(f"[backtester] pcmci_causal/{regime_name} failed: {e}")
+                logger.warning(f"[backtester] PCMCI failed for {regime_name}: {e} — using Granger only")
+
+            # ------------------ PCMCI causal variant ------------------
+            if granger_results is not None:
+                try:
+                    # If PCMCI didn't run, create empty result for selector
+                    _pcmci = pcmci_results if pcmci_results is not None else {
+                        "causal_links": {}, "p_matrix": np.array([]),
+                        "val_matrix": np.array([]), "var_names": [],
+                        "target": self.target_col, "target_idx": None,
+                    }
+
+                    # Select features using selector; do not overwrite saved global file
+                    try:
+                        features_pcmci = self.selector.select(ticker, granger_results, _pcmci, save=False)
+                    except Exception as e:
+                        logger.warning(f"[backtester] Causal selector failed for {regime_name}: {e}")
+                        features_pcmci = []
+
+                    if features_pcmci:
+                        # Use regime-specific ticker name so save() does NOT
+                        # overwrite production model files on disk.
+                        regime_ticker = f"{ticker}_{regime_name}_eval"
+                        # Pass a fresh ensemble to avoid leakage/state issues
+                        fresh = Ensemble(config_path=self.config_path)
+                        fresh.train_all(train_df, regime_ticker, features_pcmci)
+                        preds = fresh.predict_historical(regime_df, features_pcmci)
+                        if "actual_return" in preds.columns:
+                            scores = self.metrics.compute_all(
+                                preds["predicted_return"],
+                                preds["actual_return"],
+                                label=f"pcmci_selected/{regime_name}",
+                            )
+                            # Bootstrap CI for directional accuracy
+                            try:
+                                lo, hi = self.metrics.bootstrap_da_ci(
+                                    preds["predicted_return"], preds["actual_return"]
+                                )
+                                scores["directional_accuracy_ci_lower"] = lo
+                                scores["directional_accuracy_ci_upper"] = hi
+                            except Exception:
+                                scores["directional_accuracy_ci_lower"] = float("nan")
+                                scores["directional_accuracy_ci_upper"] = float("nan")
+
+                            scores["model"] = "pcmci_selected"
+                            scores["regime"] = regime_name
+                            scores["n_test"] = len(regime_df)
+                            results.append(scores)
+                    else:
+                        logger.warning(f"[backtester] No causal features for {regime_name}; skipping pcmci_causal.")
+
+                except Exception as e:
+                    logger.warning(f"[backtester] pcmci_causal/{regime_name} failed: {e}")
+
+            # ------------------ Granger-only variant ------------------
+            if granger_results is not None:
+                try:
+                    granger_features = granger.get_causal_features(granger_results)
+                    if granger_features:
+                        regime_ticker_g = f"{ticker}_{regime_name}_granger_eval"
+                        ensemble_g = Ensemble(config_path=self.config_path)
+                        ensemble_g.train_all(train_df, regime_ticker_g, granger_features)
+                        preds_g = ensemble_g.predict_historical(regime_df, granger_features)
+                        if "actual_return" in preds_g.columns:
+                            scores_g = self.metrics.compute_all(
+                                preds_g["predicted_return"],
+                                preds_g["actual_return"],
+                                label=f"granger_only/{regime_name}",
+                            )
+                            try:
+                                lo, hi = self.metrics.bootstrap_da_ci(
+                                    preds_g["predicted_return"], preds_g["actual_return"]
+                                )
+                                scores_g["directional_accuracy_ci_lower"] = lo
+                                scores_g["directional_accuracy_ci_upper"] = hi
+                            except Exception:
+                                scores_g["directional_accuracy_ci_lower"] = float("nan")
+                                scores_g["directional_accuracy_ci_upper"] = float("nan")
+
+                            scores_g["model"] = "granger_only"
+                            scores_g["regime"] = regime_name
+                            scores_g["n_test"] = len(regime_df)
+                            results.append(scores_g)
+                    else:
+                        logger.warning(f"[backtester] No Granger-causal features for {regime_name}.")
+                except Exception as e:
+                    logger.warning(f"[backtester] granger_only/{regime_name} failed: {e}")
 
             # ------------------ All-features baseline ------------------
             try:
@@ -460,3 +508,112 @@ class Backtester:
             return None
 
         return int(mask.sum()) - 1
+
+    # -----------------------------------------------------------------------
+    # Paper analysis — feature overlap and summary statistics
+    # -----------------------------------------------------------------------
+
+    def compute_feature_overlap(
+        self,
+        global_features: list[str],
+        regime_feature_sets: dict[str, list[str]],
+    ) -> pd.DataFrame:
+        """
+        For each regime, compute overlap between global and regime-specific
+        causal features. Supports the instability argument in the paper.
+
+        Args:
+            global_features:     Causal features from the full training set.
+            regime_feature_sets: Dict mapping regime name -> list of causal features.
+
+        Returns:
+            DataFrame with columns: regime, n_global, n_regime, n_overlap,
+                                    overlap_pct, regime_unique
+        """
+        global_set = set(global_features)
+        rows = []
+
+        for regime_name, regime_feats in regime_feature_sets.items():
+            if regime_name == "global":
+                continue
+            regime_set = set(regime_feats)
+            overlap = global_set & regime_set
+            unique_to_regime = regime_set - global_set
+            rows.append({
+                "regime": regime_name,
+                "n_global": len(global_set),
+                "n_regime": len(regime_set),
+                "n_overlap": len(overlap),
+                "overlap_pct": round(len(overlap) / max(len(global_set), 1), 4),
+                "regime_unique": sorted(unique_to_regime),
+            })
+
+        result = pd.DataFrame(rows)
+        if not result.empty:
+            result = result.set_index("regime")
+            logger.info(
+                f"[backtester] Feature overlap:\n{result[['n_global', 'n_regime', 'n_overlap', 'overlap_pct']]}"
+            )
+        return result
+
+    def summary_statistics(
+        self,
+        results_df: pd.DataFrame,
+    ) -> dict:
+        """
+        Compute cross-regime summary statistics for the paper's results section.
+
+        Args:
+            results_df: Output of regime_backtest() with multi-index (model, regime).
+
+        Returns:
+            Dict with summary metrics and a printable paragraph.
+        """
+        if results_df.empty or "directional_accuracy" not in results_df.columns:
+            logger.warning("[backtester] No results to summarise.")
+            return {}
+
+        summary = {}
+
+        for model_name in results_df.index.get_level_values("model").unique():
+            model_df = results_df.loc[model_name]
+            da = model_df["directional_accuracy"]
+            summary[model_name] = {
+                "mean_da": round(float(da.mean()), 4),
+                "std_da": round(float(da.std()), 4),
+                "min_da": round(float(da.min()), 4),
+                "max_da": round(float(da.max()), 4),
+                "da_degradation": round(float(da.max() - da.min()), 4),
+            }
+
+        # Stability ratio: causal model DA std vs all-features DA std
+        causal_std = summary.get("pcmci_selected", {}).get("std_da")
+        all_std = summary.get("all_features", {}).get("std_da")
+        if causal_std is not None and all_std is not None and all_std > 0:
+            summary["stability_ratio"] = round(causal_std / all_std, 4)
+        else:
+            summary["stability_ratio"] = None
+
+        # Print readable summary
+        W = 80
+        print(f"\n{'='*W}")
+        print(f"  SUMMARY STATISTICS — CROSS-REGIME PERFORMANCE")
+        print(f"{'='*W}")
+        for model_name, stats in summary.items():
+            if isinstance(stats, dict):
+                print(
+                    f"  {model_name:20s}: "
+                    f"DA mean={stats['mean_da']:.1%} ± {stats['std_da']:.1%}, "
+                    f"range=[{stats['min_da']:.1%}, {stats['max_da']:.1%}], "
+                    f"degradation={stats['da_degradation']:.1%}"
+                )
+        sr = summary.get("stability_ratio")
+        if sr is not None:
+            print(f"\n  Stability ratio (pcmci_std / all_std): {sr:.3f}")
+            if sr < 1.0:
+                print(f"  → Causal model is MORE stable across regimes (ratio < 1.0) ✓")
+            else:
+                print(f"  → Causal model is LESS stable than all-features (ratio > 1.0)")
+        print(f"{'='*W}\n")
+
+        return summary
