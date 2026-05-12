@@ -365,13 +365,51 @@ class CausalStabilityAnalyser:
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        out_path = output_dir / f"causal_stability_{ticker.upper()}.json"
+        json_path = output_dir / f"causal_stability_{ticker.upper()}.json"
+        csv_path = output_dir / "table3_causal_stability.csv"
 
-        with open(out_path, "w") as f:
+        # 1. Save raw JSON
+        with open(json_path, "w") as f:
             json.dump(stability_results, f, indent=2, default=str)
 
-        logger.info(f"[causal_stability] Saved stability report → {out_path}")
-        return out_path
+        # 2. Save Table 3 CSV
+        if "error" not in stability_results:
+            global_features = set(stability_results.get("global_features", []))
+            regime_features = stability_results.get("features_by_regime", {})
+            feature_freq = stability_results.get("feature_frequency", {})
+            jaccard_global = stability_results.get("jaccard_vs_global", {})
+            n_regimes = stability_results.get("n_regimes", 0)
+
+            regime_names = sorted(regime_features.keys())
+            all_cols = ["global"] + regime_names
+            all_features = sorted(
+                feature_freq.keys(),
+                key=lambda f: (-feature_freq.get(f, 0), f),
+            )
+
+            rows = []
+            for feat in all_features:
+                row = {"Feature": feat}
+                for col in all_cols:
+                    if col == "global":
+                        row[col] = "✓" if feat in global_features else ""
+                    else:
+                        row[col] = "✓" if feat in set(regime_features.get(col, [])) else ""
+                row["Frequency"] = f"{feature_freq.get(feat, 0)}/{n_regimes}"
+                rows.append(row)
+
+            # Jaccard row at bottom
+            jrow = {"Feature": "Jaccard vs global", "global": "—"}
+            for col in regime_names:
+                jrow[col] = f"{jaccard_global.get(col, 0.0):.3f}"
+            jrow["Frequency"] = ""
+            rows.append(jrow)
+
+            pd.DataFrame(rows).to_csv(csv_path, index=False)
+            logger.info(f"[causal_stability] Saved Table 3 CSV → {csv_path}")
+
+        logger.info(f"[causal_stability] Saved stability JSON → {json_path}")
+        return json_path
 
     # -----------------------------------------------------------------------
     # Private — helpers
