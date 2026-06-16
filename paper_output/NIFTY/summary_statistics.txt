@@ -1,0 +1,12 @@
+Summary Statistics — NIFTY
+============================================================
+all_features        : DA mean=0.4924 ± 0.0450, range=[0.4373, 0.5606], degradation=0.1233
+buy_and_hold        : DA mean=0.5738 ± 0.0417, range=[0.4922, 0.6085], degradation=0.1163
+granger_only        : DA mean=0.5001 ± 0.0197, range=[0.4801, 0.5312], degradation=0.0512
+mean_reversion      : DA mean=0.4848 ± 0.0306, range=[0.4375, 0.5202], degradation=0.0827
+momentum            : DA mean=0.5152 ± 0.0306, range=[0.4798, 0.5625], degradation=0.0827
+pcmci_selected      : DA mean=0.5281 ± 0.0687, range=[0.4297, 0.6071], degradation=0.1774
+random              : DA mean=0.5054 ± 0.0129, range=[0.4874, 0.5248], degradation=0.0373
+
+Stability ratio (pcmci_std / all_std): 1.5267
+→ Causal model is LESS stable

@@ -1,0 +1,4 @@
+regime,n_global,n_regime,n_overlap,overlap_pct,regime_unique
+gfc_recovery,6,15,6,1.0,"['bb_width', 'close_vs_200ma', 'india_vix', 'macd_hist', 'macd_signal', 'pb_ma_10', 'volatility_10d', 'volatility_20d', 'volatility_30d']"
+pre_demonetisation,6,15,6,1.0,"['bb_width', 'close_vs_200ma', 'macd_hist', 'macd_signal', 'pb_ma_10', 'pb_ratio', 'volatility_10d', 'volatility_20d', 'volatility_30d']"
+recovery_india,6,15,6,1.0,"['close_vs_200ma', 'macd_hist', 'macd_signal', 'pb_ma_10', 'pb_percentile', 'pb_ratio', 'volatility_10d', 'volatility_20d', 'volatility_30d']"
