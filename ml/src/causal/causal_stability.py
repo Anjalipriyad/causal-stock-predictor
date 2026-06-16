@@ -441,25 +441,21 @@ class CausalStabilityAnalyser:
         from ml.src.causal.pcmci import PCMCIDiscovery
         from ml.src.causal.selector import CausalSelector
 
-        # Strip target columns from the feature set
-        cols_to_drop = [c for c in target_cols if c in subset_df.columns]
-        df_causal = subset_df.drop(columns=cols_to_drop, errors="ignore")
+        from ml.src.causal.leakage_guard import make_causal_discovery_frame
 
-        # Re-add only the target for Granger (it needs y in the df)
-        if target in subset_df.columns:
-            df_granger = df_causal.copy()
-            df_granger[target] = subset_df[target]
-        else:
+        if target not in subset_df.columns:
             logger.warning(
                 f"[causal_stability] Target '{target}' not in {label} data — skipping"
             )
             return []
 
+        df_causal = make_causal_discovery_frame(subset_df, target)
+
         # ── Granger always runs — it's the baseline ─────────────────────
         granger_results = None
         try:
             granger = GrangerCausality(self.config_path)
-            granger_results = granger.run(df_granger, target=target, verbose=False)
+            granger_results = granger.run(df_causal, target=target, verbose=False)
         except Exception as e:
             logger.error(f"[causal_stability] Granger failed for {label}: {e}")
 
@@ -470,12 +466,9 @@ class CausalStabilityAnalyser:
                 # Use last 50% for PCMCI (consistent with main pipeline)
                 n_pcmci = max(200, len(df_causal) // 2)
                 df_pcmci = df_causal.iloc[-n_pcmci:]
-                if target in subset_df.columns:
-                    df_pcmci = df_pcmci.copy()
-                    df_pcmci[target] = subset_df.loc[df_pcmci.index, target]
 
                 pcmci = PCMCIDiscovery(self.config_path)
-                pcmci_results = pcmci.run(df_pcmci, target=target, exclude_target=True)
+                pcmci_results = pcmci.run(df_pcmci, target=target, exclude_target=False)
             except Exception as e:
                 logger.warning(
                     f"[causal_stability] PCMCI failed for {label}: {e} — "
