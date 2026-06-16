@@ -98,6 +98,7 @@ class SignificanceTester:
         y_pred: pd.Series,
         y_true: pd.Series,
         null_da: float = 0.50,
+        horizon_days: int = 5,
     ) -> SignificanceResult:
         """
         One-sided binomial test: H0: DA ≤ null_da (random baseline).
@@ -106,29 +107,53 @@ class SignificanceTester:
         This is the most basic question: is the model better than flipping
         a coin? Use this for every model in Table 2.
 
+        OVERLAP CORRECTION (horizon_days):
+            When predicting h-day forward returns from daily observations,
+            consecutive return windows overlap by (h-1) days. This induces
+            serial correlation that makes the raw N overstate the true
+            number of independent observations. We correct by using
+            effective_n = N // h, which approximates the number of
+            non-overlapping return windows. This produces conservative
+            (honest) p-values. See Lo & MacKinlay (1988) for the
+            theoretical foundation.
+
         Args:
-            y_pred:   Predicted returns (sign determines predicted direction)
-            y_true:   Actual returns
-            null_da:  Null hypothesis DA (default 0.50 = random)
+            y_pred:       Predicted returns (sign determines predicted direction)
+            y_true:       Actual returns
+            null_da:      Null hypothesis DA (default 0.50 = random)
+            horizon_days: Forecast horizon in trading days (default 5).
+                          Used to compute effective sample size = N // h.
 
         Returns:
-            SignificanceResult with p-value for one-sided test.
+            SignificanceResult with p-value for one-sided test using effective N.
         """
         y_pred, y_true = self._align(y_pred, y_true)
         n        = len(y_true)
         correct  = int(((y_pred >= 0) == (y_true >= 0)).sum())
         da       = correct / n
 
-        # Binomial test: probability of getting >= correct out of n with p=null_da
-        result = stats.binomtest(correct, n, null_da, alternative="greater")
+        # OVERLAP CORRECTION: 5-day returns observed daily share 4/5 days
+        # with adjacent observations. effective_n ≈ number of independent
+        # non-overlapping windows. Floor of 10 prevents degenerate tests.
+        effective_n       = max(n // horizon_days, 10)
+        effective_correct = int(round(da * effective_n))
+
+        # Binomial test using effective sample size
+        result = stats.binomtest(
+            effective_correct, effective_n, null_da, alternative="greater"
+        )
 
         return SignificanceResult(
             test_name   = f"Binomial test (H0: DA ≤ {null_da})",
             statistic   = da,
             p_value     = result.pvalue,
             significant = result.pvalue < self.alpha,
-            n           = n,
-            note        = f"Observed {correct}/{n} correct ({da:.3f})",
+            n           = effective_n,
+            note        = (
+                f"Observed {correct}/{n} correct ({da:.3f}), "
+                f"effective_n={effective_n} (raw n={n}, "
+                f"horizon={horizon_days}d overlap correction applied)"
+            ),
         )
 
     # -----------------------------------------------------------------------
@@ -164,35 +189,33 @@ class SignificanceTester:
         Returns:
             SignificanceResult. p < 0.05 means models differ significantly.
         """
-        from statsmodels.stats.contingency_tables import mcnemar as sm_mcnemar
-
         y_pred_a, y_true = self._align(y_pred_a, y_true)
         y_pred_b, _      = self._align(y_pred_b, y_true)
 
         correct_a = (np.sign(y_pred_a) == np.sign(y_true)).astype(int)
         correct_b = (np.sign(y_pred_b) == np.sign(y_true)).astype(int)
 
-        # Contingency table:
-        #           B correct   B wrong
-        # A correct    n11         n10
-        # A wrong      n01         n00
-        n11 = int((correct_a & correct_b).sum())
         n10 = int((correct_a & ~correct_b).sum())
         n01 = int((~correct_a & correct_b).sum())
-        n00 = int((~correct_a & ~correct_b).sum())
-
-        table   = np.array([[n11, n10], [n01, n00]])
-        result  = sm_mcnemar(table, exact=False, correction=True)
 
         da_a = correct_a.mean()
         da_b = correct_b.mean()
         n    = len(y_true)
 
+        n_disagree = n10 + n01
+        if n_disagree == 0:
+            stat = 0.0
+            p_value = 1.0
+        else:
+            # Chi-squared approximation with Edwards' continuity correction
+            stat = float(((abs(n10 - n01) - 1.0) ** 2) / n_disagree)
+            p_value = float(stats.chi2.sf(stat, df=1))
+
         return SignificanceResult(
             test_name   = f"McNemar's test ({label_a} vs {label_b})",
-            statistic   = result.statistic,
-            p_value     = result.pvalue,
-            significant = result.pvalue < self.alpha,
+            statistic   = stat,
+            p_value     = p_value,
+            significant = p_value < self.alpha,
             effect_size = da_a - da_b,
             n           = n,
             note        = (
@@ -211,6 +234,7 @@ class SignificanceTester:
         y_true: pd.Series,
         n_bootstrap: int = 2000,
         ci: float = 0.95,
+        horizon_days: int = 5,
         seed: int = 42,
     ) -> SignificanceResult:
         """
@@ -238,7 +262,8 @@ class SignificanceTester:
         rng       = np.random.default_rng(seed)
 
         # Block bootstrap: preserve temporal autocorrelation
-        block_size = max(1, int(np.sqrt(n)))
+        # Ensure block size spans at least double the overlap window (horizon * 2)
+        block_size = max(int(np.sqrt(n)), horizon_days * 2)
         correct    = ((y_pred >= 0) == (y_true >= 0)).astype(int).values
         observed_da = correct.mean()
 

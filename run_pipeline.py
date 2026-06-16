@@ -141,6 +141,10 @@ def step3_causal_discovery(ticker: str) -> list[str]:
     from ml.src.causal.granger import GrangerCausality
     from ml.src.causal.pcmci import PCMCIDiscovery
     from ml.src.causal.selector import CausalSelector
+    from ml.src.causal.leakage_guard import (
+        forward_return_columns,
+        make_causal_discovery_frame,
+    )
 
     cfg       = _load_config()
     feat_path = get_feat_path(ticker)
@@ -175,11 +179,12 @@ def step3_causal_discovery(ticker: str) -> list[str]:
     # Leaving them as regular columns causes PCMCI/Granger to find spurious
     # causal links from features that are mathematically related to the
     # target — not genuine causal relationships.
-    TARGET_COL       = cfg["model"]["target"]       # excess_return_5d
-    AUXILIARY_TARGET  = "log_return_5d"             # always drop this too
-    cols_to_drop = [c for c in [TARGET_COL, AUXILIARY_TARGET, "excess_return_5d"]
-                    if c in df_train.columns]
-    df_causal = df_train.drop(columns=cols_to_drop)
+    cols_to_drop = forward_return_columns(
+        df_train.columns,
+        active_target=target,
+        keep_active_target=True,
+    )
+    df_causal = make_causal_discovery_frame(df_train, target)
     logger.info(
         f"[causal] Dropped {cols_to_drop} before causal discovery "
         f"({len(df_causal.columns)} features remain)"
@@ -190,22 +195,14 @@ def step3_causal_discovery(ticker: str) -> list[str]:
     start            = time.time()
     granger          = GrangerCausality()
     # Re-add only the target column for Granger (it tests X → target)
-    df_granger = df_causal.copy()
-    df_granger[target] = df_train[target]
-    granger_results  = granger.run(df_granger, target=target, verbose=False)
+    granger_results  = granger.run(df_causal, target=target, verbose=False)
     granger_features = granger.get_causal_features(granger_results)
     logger.info(f"Granger done in {elapsed(start)} — {len(granger_features)} causal features")
 
     # PCMCI — last 50% of training data (no test leakage)
     logger.info("Running PCMCI on last 50% of training data (5-15 mins)...")
     start      = time.time()
-    df_pcmci_full = df_train.iloc[-int(len(df_train) * 0.5):]
-    # Drop target/auxiliary columns from PCMCI input too
-    df_pcmci = df_pcmci_full.drop(
-        columns=[c for c in cols_to_drop if c in df_pcmci_full.columns]
-    )
-    # Re-add only the target for PCMCI's exclude_target mode
-    df_pcmci[target] = df_pcmci_full[target]
+    df_pcmci = df_causal.iloc[-int(len(df_causal) * 0.5):]
     logger.info(
         f"PCMCI dataset: {len(df_pcmci)} rows "
         f"({df_pcmci.index.min().date()} → {df_pcmci.index.max().date()})"
@@ -215,7 +212,7 @@ def step3_causal_discovery(ticker: str) -> list[str]:
     # variable set (which can bias conditional-independence tests), run
     # PCMCI on the feature set only and use Granger for direct feature→target
     # strength. This prevents target-derived leakage inside PCMCI's graph.
-    pcmci_results  = pcmci.run(df_pcmci, target=target, exclude_target=True)
+    pcmci_results  = pcmci.run(df_pcmci, target=target, exclude_target=False)
     pcmci_features = pcmci.get_causal_features(pcmci_results)
     logger.info(f"PCMCI done in {elapsed(start)} — {len(pcmci_features)} causal features")
 

@@ -160,7 +160,7 @@ causal:
 # -----------------------------------------------------------------------------
 model:
 
-  target: "excess_return_5d"
+  target: "log_return_5d"
   horizon_days: 5
 
   # Chronological split ratios (train/val/test)

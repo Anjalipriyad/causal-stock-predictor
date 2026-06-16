@@ -8,18 +8,19 @@
     "macd",
     "macd_hist",
     "macd_signal",
+    "market_cheap",
     "momentum_10d",
     "momentum_20d",
     "momentum_5d",
     "pb_change_1d",
     "pb_ma_10",
     "pb_percentile",
-    "pe_percentile",
-    "pe_ratio"
+    "pb_ratio"
   ],
   "features_by_regime": {
     "gfc_recovery": [
       "bb_pct",
+      "bb_width",
       "close_vs_200ma",
       "india_vix",
       "log_return_1d",
@@ -32,25 +33,24 @@
       "pb_change_1d",
       "pb_ma_10",
       "pb_percentile",
-      "pe_percentile",
-      "pe_ratio"
+      "pb_ratio"
     ],
     "pre_demonetisation": [
+      "bb_pct",
+      "bb_width",
       "close_vs_200ma",
       "log_return_1d",
       "macd",
       "macd_hist",
       "macd_signal",
+      "momentum_10d",
+      "momentum_20d",
+      "momentum_5d",
       "pb_change_1d",
+      "pb_ma_10",
+      "pb_percentile",
       "pb_ratio",
-      "pe_accel",
-      "pe_change_1d",
-      "pe_ratio",
-      "pe_vs_1y_high",
-      "pe_vs_5y_mean",
-      "rsi_14",
-      "vix_change_5d",
-      "vix_delta_3d"
+      "pe_accel"
     ],
     "recovery_india": [
       "bb_pct",
@@ -59,76 +59,65 @@
       "macd",
       "macd_hist",
       "macd_signal",
+      "market_expensive",
+      "momentum_10d",
       "momentum_20d",
+      "momentum_5d",
       "pb_change_1d",
+      "pb_ma_10",
       "pb_percentile",
       "pb_ratio",
-      "pe_change_1d",
-      "pe_change_5d",
-      "pe_ma_10",
-      "pe_ratio",
-      "pe_vs_1y_high"
+      "pe_accel"
     ]
   },
   "feature_frequency": {
-    "bb_pct": 2,
+    "bb_pct": 3,
+    "bb_width": 2,
     "close_vs_200ma": 3,
     "india_vix": 1,
     "log_return_1d": 3,
     "macd": 3,
     "macd_hist": 3,
     "macd_signal": 3,
-    "momentum_10d": 1,
-    "momentum_20d": 2,
-    "momentum_5d": 1,
+    "market_cheap": 0,
+    "market_expensive": 1,
+    "momentum_10d": 3,
+    "momentum_20d": 3,
+    "momentum_5d": 3,
     "pb_change_1d": 3,
-    "pb_ma_10": 1,
-    "pb_percentile": 2,
-    "pb_ratio": 2,
-    "pe_accel": 1,
-    "pe_change_1d": 2,
-    "pe_change_5d": 1,
-    "pe_ma_10": 1,
-    "pe_percentile": 1,
-    "pe_ratio": 3,
-    "pe_vs_1y_high": 2,
-    "pe_vs_5y_mean": 1,
-    "rsi_14": 1,
-    "vix_change_5d": 1,
-    "vix_delta_3d": 1
+    "pb_ma_10": 3,
+    "pb_percentile": 3,
+    "pb_ratio": 3,
+    "pe_accel": 2
   },
   "jaccard_pairwise": {
-    "gfc_recovery_vs_pre_demonetisation": 0.3043,
-    "gfc_recovery_vs_recovery_india": 0.5,
-    "pre_demonetisation_vs_recovery_india": 0.5
+    "gfc_recovery_vs_pre_demonetisation": 0.875,
+    "gfc_recovery_vs_recovery_india": 0.7647,
+    "pre_demonetisation_vs_recovery_india": 0.875
   },
   "jaccard_vs_global": {
-    "gfc_recovery": 1.0,
-    "pre_demonetisation": 0.3043,
-    "recovery_india": 0.5
+    "gfc_recovery": 0.875,
+    "pre_demonetisation": 0.7647,
+    "recovery_india": 0.7647
   },
   "stable_features": [
+    "bb_pct",
     "close_vs_200ma",
     "log_return_1d",
     "macd",
     "macd_hist",
     "macd_signal",
+    "momentum_10d",
+    "momentum_20d",
+    "momentum_5d",
     "pb_change_1d",
-    "pe_ratio"
+    "pb_ma_10",
+    "pb_percentile",
+    "pb_ratio"
   ],
   "regime_specific_features": [
     "india_vix",
-    "momentum_10d",
-    "momentum_5d",
-    "pb_ma_10",
-    "pe_accel",
-    "pe_change_5d",
-    "pe_ma_10",
-    "pe_percentile",
-    "pe_vs_5y_mean",
-    "rsi_14",
-    "vix_change_5d",
-    "vix_delta_3d"
+    "market_expensive"
   ],
   "stability_threshold": ">= 3/3 regimes (75%)"
 }

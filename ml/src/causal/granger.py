@@ -31,8 +31,30 @@ from typing import Optional
 
 import pandas as pd
 import numpy as np
-from statsmodels.tsa.stattools import grangercausalitytests
-from statsmodels.stats.multitest import multipletests
+try:
+    from statsmodels.tsa.stattools import grangercausalitytests
+    from statsmodels.stats.multitest import multipletests
+    STATSMODELS_AVAILABLE = True
+except ImportError:
+    STATSMODELS_AVAILABLE = False
+    
+    # Custom implementation of Benjamini-Hochberg FDR correction
+    def multipletests(pvals, alpha=0.05, method="fdr_bh"):
+        pvals = np.array(pvals)
+        n = len(pvals)
+        sort_idx = np.argsort(pvals)
+        sorted_pvals = pvals[sort_idx]
+        
+        adjusted = np.zeros(n)
+        prev_adj = 1.0
+        for i in range(n - 1, -1, -1):
+            adj = sorted_pvals[i] * n / (i + 1)
+            adj = min(adj, prev_adj)
+            adjusted[sort_idx[i]] = adj
+            prev_adj = adj
+            
+        reject = adjusted < alpha
+        return reject, adjusted, None, None
 
 from ml.src.data.loader import _load_config
 
@@ -198,17 +220,57 @@ class GrangerCausality:
         data_seg = full.iloc[best_seg[0] : best_seg[-1] + 1]
 
         try:
-            test_results = grangercausalitytests(
-                data_seg,
-                maxlag=self.max_lag,
-                verbose=False,
-            )
+            if not STATSMODELS_AVAILABLE:
+                from sklearn.linear_model import LinearRegression
+                from scipy import stats
+                
+                pvals = []
+                y = data_seg[target].to_numpy()
+                x = data_seg[feature].to_numpy()
+                n = len(y)
+                
+                for lag in range(1, self.max_lag + 1):
+                    Y_target = y[lag:]
+                    
+                    # Restricted model: lagged target only
+                    X_restricted = np.column_stack([y[lag - i: n - i] for i in range(1, lag + 1)])
+                    
+                    # Unrestricted model: lagged target + lagged feature
+                    X_unrestricted = np.column_stack([
+                        y[lag - i: n - i] for i in range(1, lag + 1)
+                    ] + [
+                        x[lag - i: n - i] for i in range(1, lag + 1)
+                    ])
+                    
+                    # restricted fit
+                    lr_r = LinearRegression().fit(X_restricted, Y_target)
+                    ssr_r = np.sum((Y_target - lr_r.predict(X_restricted)) ** 2)
+                    
+                    # unrestricted fit
+                    lr_u = LinearRegression().fit(X_unrestricted, Y_target)
+                    ssr_u = np.sum((Y_target - lr_u.predict(X_unrestricted)) ** 2)
+                    
+                    df1 = lag
+                    df2 = len(Y_target) - 2 * lag - 1
+                    
+                    if ssr_u == 0 or df2 <= 0:
+                        pval = 1.0
+                    else:
+                        F = ((ssr_r - ssr_u) / df1) / (ssr_u / df2)
+                        pval = float(stats.f.sf(F, df1, df2))
+                    
+                    pvals.append((lag, pval))
+            else:
+                test_results = grangercausalitytests(
+                    data_seg,
+                    maxlag=self.max_lag,
+                    verbose=False,
+                )
 
-            # Extract minimum p-value across all lags
-            pvals = []
-            for lag, result in test_results.items():
-                pval = result[0][self.test][1]
-                pvals.append((lag, pval))
+                pvals = []
+                for lag, result in test_results.items():
+                    pval = result[0][self.test][1]
+                    pvals.append((lag, pval))
 
             best_lag, min_pval = min(pvals, key=lambda x: x[1])
             is_causal = bool(min_pval < self.significance)

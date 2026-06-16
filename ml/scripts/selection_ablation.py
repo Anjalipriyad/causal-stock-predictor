@@ -18,6 +18,7 @@ from ml.src.data.loader import _load_config
 from ml.src.causal.granger import GrangerCausality
 from ml.src.causal.pcmci import PCMCIDiscovery
 from ml.src.causal.selector import CausalSelector
+from ml.src.causal.leakage_guard import make_causal_discovery_frame
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ablation")
@@ -46,20 +47,21 @@ def main():
     n = len(df)
     train_end = int(n * cfg["model"]["train_ratio"]) if n > 0 else 0
     df_train = df.iloc[:train_end]
+    df_train_causal = make_causal_discovery_frame(df_train, target)
     if df_train.empty:
         raise RuntimeError("Not enough rows for training split — aborting ablation.")
 
     # Granger on full training set
     granger = GrangerCausality()
     logger.info("Running Granger causality on training set...")
-    granger_results = granger.run(df_train, target=target, verbose=False)
+    granger_results = granger.run(df_train_causal, target=target, verbose=False)
 
     # PCMCI on last 50% of training set (consistent with pipeline)
-    df_pcmci = df_train.iloc[-int(len(df_train) * 0.5):]
+    df_pcmci = df_train_causal.iloc[-int(len(df_train_causal) * 0.5):]
     pcmci = PCMCIDiscovery()
     try:
         logger.info("Running PCMCI on last 50% of training set...")
-        pcmci_results = pcmci.run(df_pcmci, target=target)
+        pcmci_results = pcmci.run(df_pcmci, target=target, exclude_target=False)
     except Exception as e:
         logger.warning(f"PCMCI run failed: {e} — continuing with empty PCMCI results.")
         pcmci_results = {"causal_links": {}}

@@ -391,3 +391,38 @@ class Metrics:
             y_true = pd.Series(y_true)
         combined = pd.concat([y_pred, y_true], axis=1).dropna()
         return combined.iloc[:, 0], combined.iloc[:, 1]
+
+
+# ---------------------------------------------------------------------------
+# Standalone utility: overlap-corrected effective sample size
+# ---------------------------------------------------------------------------
+
+def effective_sample_size(n_observations: int, horizon_days: int = 5) -> int:
+    """
+    Compute the effective number of independent observations when using
+    overlapping return windows.
+
+    When predicting h-day forward returns from daily observations,
+    consecutive return windows overlap by (h-1) days. For example,
+    with 5-day returns:
+        return[t]   uses days t..t+4
+        return[t+1] uses days t+1..t+5
+    These share 4 of 5 days, inducing strong serial correlation.
+
+    The effective sample size is approximately N // h, representing
+    the number of non-overlapping return windows that fit in the
+    observation period. This correction should be applied to any
+    statistical test (binomial, t-test, etc.) that assumes i.i.d.
+    observations.
+
+    Reference: Lo & MacKinlay (1988), "Stock Market Prices Do Not
+    Follow Random Walks: Evidence from a Simple Specification Test"
+
+    Args:
+        n_observations: Total number of (overlapping) daily observations.
+        horizon_days:   Forecast horizon in trading days (default 5).
+
+    Returns:
+        Effective number of independent observations (minimum 1).
+    """
+    return max(n_observations // horizon_days, 10)

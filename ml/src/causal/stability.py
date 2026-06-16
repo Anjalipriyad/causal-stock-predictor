@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 from ml.src.data.loader import _load_config
+from ml.src.causal.leakage_guard import make_causal_discovery_frame
 
 logger = logging.getLogger(__name__)
 
@@ -245,8 +246,9 @@ class PCMCIStabilityAnalyzer:
         """Run PCMCI on a single window and return discovered causal features."""
         from ml.src.causal.pcmci import PCMCIDiscovery
         try:
+            window_df = make_causal_discovery_frame(window_df, target)
             pcmci   = PCMCIDiscovery()
-            results = pcmci.run(window_df, target=target)
+            results = pcmci.run(window_df, target=target, exclude_target=False)
             return pcmci.get_causal_features(results)
         except Exception as e:
             logger.warning(f"[stability] Window {window_num} PCMCI failed: {e}")

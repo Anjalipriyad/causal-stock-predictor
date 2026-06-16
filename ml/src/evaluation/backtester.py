@@ -44,6 +44,7 @@ from ml.src.evaluation.regime_splitter import RegimeSplitter
 from ml.src.causal.selector import CausalSelector
 from ml.src.causal.granger import GrangerCausality
 from ml.src.causal.pcmci import PCMCIDiscovery
+from ml.src.causal.leakage_guard import make_causal_discovery_frame, safe_feature_columns
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,17 @@ class Backtester:
                 directional_accuracy, sharpe_ratio, rmse, max_drawdown
         """
         logger.info(f"[backtester] Walk-forward backtest for {ticker} ...")
+
+        # Auto-detect correct target column
+        if self.target_col not in df.columns:
+            fallback_targets = ['log_return_5d', 'excess_return_5d']
+            for t in fallback_targets:
+                if t in df.columns:
+                    self.target_col = t
+                    logger.info(f"[backtester] Target column auto-detected: {t}")
+                    break
+            else:
+                raise ValueError(f"No valid target column found. Tried: {fallback_targets}")
 
         results   = []
         start_idx = self._find_initial_train_end(df)
@@ -197,13 +209,19 @@ class Backtester:
         """
         logger.info(f"[backtester] Regime backtest for {ticker} ...")
 
-        # CRITICAL: Strip ALL forward-looking targets so the baseline isn't cheating
-        all_feature_cols = [
-            c for c in df.columns
-            if c != self.target_col
-            and not c.startswith("excess_return_")
-            and not (c.startswith("log_return_") and c != "log_return_1d")
-        ]
+        # Auto-detect correct target column
+        if self.target_col not in df.columns:
+            fallback_targets = ['log_return_5d', 'excess_return_5d']
+            for t in fallback_targets:
+                if t in df.columns:
+                    self.target_col = t
+                    logger.info(f"[backtester] Target column auto-detected: {t}")
+                    break
+            else:
+                raise ValueError(f"No valid target column found. Tried: {fallback_targets}")
+
+        # CRITICAL: Strip ALL forward-looking labels so the baseline isn't cheating
+        all_feature_cols = safe_feature_columns(df, active_target=self.target_col)
         regime_splits = self.splitter.split_all(df)
         results       = []
 
@@ -232,12 +250,7 @@ class Backtester:
             # shift(-horizon) future prices. If PCMCI sees these, any feature with
             # autocorrelation to price will appear causally linked via shared
             # future information, inflating Table 2 directional accuracy.
-            leaky_cols = [c for c in train_df.columns
-                          if c.startswith("log_return_") and c != "log_return_1d"
-                          or c.startswith("excess_return_")]
-            # Keep only the configured target for Granger (it needs y in the df)
-            cols_to_drop = [c for c in leaky_cols if c != self.target_col]
-            train_df_clean = train_df.drop(columns=cols_to_drop, errors="ignore")
+            train_df_clean = make_causal_discovery_frame(train_df, self.target_col)
 
             # ── Granger always runs — it's the baseline ─────────────────
             granger_results = None
@@ -252,7 +265,7 @@ class Backtester:
             try:
                 df_pcmci = train_df_clean.iloc[-int(len(train_df_clean) * 0.5):]
                 pcmci = PCMCIDiscovery()
-                pcmci_results = pcmci.run(df_pcmci, target=self.target_col, exclude_target=True)
+                pcmci_results = pcmci.run(df_pcmci, target=self.target_col, exclude_target=False)
             except Exception as e:
                 logger.warning(f"[backtester] PCMCI failed for {regime_name}: {e} — using Granger only")
 

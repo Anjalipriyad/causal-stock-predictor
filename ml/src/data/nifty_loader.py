@@ -209,9 +209,12 @@ class NiftyLoader:
         result["india_vix"]            = pd.to_numeric(df["Vix"], errors="coerce")
         result["precomputed_sentiment"] = df["_sent_norm"]
 
-        # 1-day and 5-day changes
-        result["pe_change_1d"]  = result["pe_ratio"].diff(1)
-        result["pb_change_1d"]  = result["pb_ratio"].diff(1)
+        # DROPPED: pe_change_1d — r=+0.71 correlation with log_return_1d, adds no
+        # independent causal signal beyond existing return feature. Because
+        # P/E = Price / static_trailing_EPS, daily P/E change ≈ daily price change.
+        # DROPPED: pb_change_1d — r=+0.87 correlation with log_return_1d, same
+        # mechanism (P/B = Price / static_Book). Even more redundant than pe_change_1d.
+        # See paper_output/NIFTY/pe_pb_data_validation.txt for full analysis.
         result["vix_change_1d"] = result["india_vix"].diff(1)
         result["vix_change_5d"] = result["india_vix"].diff(5)
 
@@ -219,6 +222,7 @@ class NiftyLoader:
         # valuation vs momentum (PE rising quickly often signals a different
         # regime than persistently high PE)
         result["pe_change_5d"]   = result["pe_ratio"].diff(5)
+        # VERIFIED: rolling(252).max() is backward-looking — at time t uses [t-251, t]
         result["pe_vs_1y_high"]  = (
             result["pe_ratio"]
             / result["pe_ratio"].rolling(252, min_periods=60).max()
@@ -245,13 +249,16 @@ class NiftyLoader:
             result["vix_falling"].astype(float) * (result["pe_ratio"] > 22).astype(float)
         ).astype(float)
 
-        # Percentile ranks: where is today vs the past 252 trading days
-        # min_periods=60 allows these to be computed after ~3 months of data
-        result["vix_percentile"] = result["india_vix"].rolling(252, min_periods=60).rank(pct=True)
-        result["pe_percentile"]  = result["pe_ratio"].rolling(252,  min_periods=60).rank(pct=True)
-        result["pb_percentile"]  = result["pb_ratio"].rolling(252,  min_periods=60).rank(pct=True)
+        # LEAKAGE FIX: replaced rolling(252).rank(pct=True) with expanding().rank(pct=True)
+        # so percentile at time t uses ALL data from start..t, not a fixed 252-day window.
+        # rolling(252) was already backward-looking, but expanding is more robust:
+        # it prevents percentile jumps when old extreme values exit the fixed window,
+        # and gives the model a stable "all-history" percentile at every point.
+        result["vix_percentile"] = result["india_vix"].expanding(min_periods=60).rank(pct=True)
+        result["pe_percentile"]  = result["pe_ratio"].expanding(min_periods=60).rank(pct=True)
+        result["pb_percentile"]  = result["pb_ratio"].expanding(min_periods=60).rank(pct=True)
 
-        # Regime signals: is current value above its 60-day average?
+        # VERIFIED: rolling(60).mean() is backward-looking — at time t uses [t-59, t]
         result["pe_regime"]  = (
             result["pe_ratio"] > result["pe_ratio"].rolling(60, min_periods=20).mean()
         ).astype(float)
@@ -271,6 +278,7 @@ class NiftyLoader:
 
         # Additional long-window valuation feature: 5-year PE mean deviation
         # computed here so it's available to downstream regime logic.
+        # VERIFIED: rolling(1260).mean() is backward-looking — at time t uses [t-1259, t]
         result["pe_vs_5y_mean"] = (
             result["pe_ratio"]
             / result["pe_ratio"].rolling(1260, min_periods=252).mean()
@@ -391,6 +399,7 @@ class NiftyLoader:
 
         # 3b. Close vs 200-day MA — computed here because we have the price
         # series available in this scope. Uses min_periods=60 (~3 months).
+        # VERIFIED: rolling(200).mean() is backward-looking — at time t uses [t-199, t]
         try:
             close_vs_200 = (
                 price_df["close"]

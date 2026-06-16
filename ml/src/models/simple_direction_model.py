@@ -42,12 +42,14 @@ class SimpleDirectionModel:
         self._scaler = StandardScaler()
 
         # Default simple features (will pick intersection with available columns)
+        # Note: pe_change_1d was dropped (r=0.71 with log_return_1d, redundant).
+        # pe_change_5d (r=0.30) retains independent valuation signal.
         self._candidate_features = [
             "momentum_5d",
             "momentum_20d",
             "india_vix",
             "vix_change_5d",
-            "pe_change_1d",
+            "pe_change_5d",
         ]
 
     # -----------------------------------------------------------------------

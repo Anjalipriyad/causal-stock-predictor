@@ -338,8 +338,20 @@ def check_3_significance(df, causal_features, target, ticker, market, results):
     print(f"\n{binom}")
     print(f"\n{boot}")
 
+    # Overlap correction diagnostic block
+    effective_n = len(y_true) // 5
+    print(f"\n  {'─'*50}")
+    print(f"  OVERLAP CORRECTION SUMMARY")
+    print(f"  {'─'*50}")
+    print(f"  Raw observations:      {len(y_true)}")
+    print(f"  Effective sample size: {effective_n}")
+    print(f"  Overlap correction:    5-day returns, 4-day overlap")
+    print(f"  All p-values below use effective N")
+    print(f"  {'─'*50}")
+
     results["significance"] = {
         "test_set_n":           int(len(y_true)),
+        "effective_n":          effective_n,
         "test_set_da":          float(binom.statistic),
         "binomial_p":           float(binom.p_value),
         "binomial_significant": bool(binom.significant),
@@ -352,12 +364,12 @@ def check_3_significance(df, causal_features, target, ticker, market, results):
     if binom.significant:
         logger.info(
             f"✓ DA={binom.statistic:.3f} significantly > 0.50 "
-            f"(p={binom.p_value:.4f}, n={len(y_true)})"
+            f"(p={binom.p_value:.4f}, effective_n={effective_n}, raw_n={len(y_true)})"
         )
     else:
         logger.warning(
             f"⚠ DA={binom.statistic:.3f} NOT significantly > 0.50 "
-            f"(p={binom.p_value:.4f}) — critical paper weakness."
+            f"(p={binom.p_value:.4f}, effective_n={effective_n}) — critical paper weakness."
         )
 
 
